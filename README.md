@@ -1,1 +1,1 @@
-# hs-lxd
+# lxd

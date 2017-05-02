@@ -15,14 +15,35 @@ cabal-version:       >=1.10
 
 library
   hs-source-dirs:      src
-  exposed-modules:     Lib
+  exposed-modules:     System.LXD
+  ghc-options:         -Wall
   build-depends:       base >= 4.7 && < 5
+                     , bytestring
+                     , http-client
+                     , unix
+                     , text
+                     , http-conduit
+                     , network
+                     , mtl
+                     , time
+                     , conduit
+                     , aeson
+                     , scientific
+                     , exceptions
+                     , unordered-containers
+                     , lens-aeson
+                     , lens
+                     , data-default
+                     , http-types
+                     , websockets
+                     , transformers
   default-language:    Haskell2010
 
 executable simple
   hs-source-dirs:      examples
+  buildable:           False
   main-is:             Main.hs
-  ghc-options:         -threaded -rtsopts -with-rtsopts=-N
+  ghc-options:         -threaded -rtsopts -with-rtsopts=-N -Wall
   build-depends:       base
                      , lxd
   default-language:    Haskell2010
@@ -33,7 +54,7 @@ test-suite lxd-test
   main-is:             Spec.hs
   build-depends:       base
                      , lxd
-  ghc-options:         -threaded -rtsopts -with-rtsopts=-N
+  ghc-options:         -threaded -rtsopts -with-rtsopts=-N -Wall
   default-language:    Haskell2010
 
 source-repository head

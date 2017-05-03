@@ -315,7 +315,7 @@ runWS ep app = LXDT $ ask >>= \case
 
 baseUrl :: Monad m => LXDT m [Char]
 baseUrl = LXDT $ ask >>= \case
-  LXDEnv _ Local -> return "http://example.com"
+  LXDEnv _ Local -> return "http://localhost"
   LXDEnv _ Remote{..} ->
     return $ "https://" ++ lxdServerHost ++ maybe "" ((':':).show) lxdServerPort
 
@@ -631,31 +631,25 @@ getAsyncHandle :: (MonadBaseControl IO m, MonadThrow m, MonadIO m)
 getAsyncHandle TaskProc{} = return Nothing
 getAsyncHandle ap@InteractiveProc{..} = Just <$> do
   let ep = wsEP ap apISocket
-  liftIO $ putStrLn "Initiating queues..."
   (inCh, outCh) <- liftIO $ (,) <$> newTBMQueueIO 10 <*> newTBMQueueIO 10
-  liftIO $ putStrLn "Done. Communicating with WS in different thread..."
   let close = atomically $ closeTBMQueue inCh >> closeTBMQueue outCh
       h ConnectionClosed = liftIO close
       h CloseRequest{} = liftIO close
       h e = throwM e
       h' lab e = throwIO $ WebSocketError lab e
   tid <- fork $ runWS ep $ \conn -> handles [Handler $ h' "interactive", Handler h] $ flip finally (sendClose conn "") $
-    (repeatMC (receiveData conn) .| mapMC (\a -> liftIO (putStrLn $ "inter: " <> show a) >> return a)
-                                 $$ sinkTBMQueue outCh True)
+    (repeatMC (receiveData conn) $$ sinkTBMQueue outCh True)
       `concurrently_`
-    (sourceTBMQueue inCh .| mapMC (\a -> liftIO (putStrLn $ "sending: " <> show a) >> return a)
-                         $$ mapM_C (sendBinaryData conn))
+    (sourceTBMQueue inCh $$ mapM_C (sendBinaryData conn))
   let ahStdin  = atomically . writeTBMQueue inCh
       ahOutput = atomically $ readTBMQueue outCh
       ahCloseStdin    = atomically $ closeTBMQueue inCh
       ahCloseProcess  = killThread tid >> close
-  liftIO $ putStrLn "Rerturning handle."
   return $ SimpleHandle {..}
 getAsyncHandle ap@ThreewayProc{..} = Just <$> do
   let iep = wsEP ap apStdin
       oep = wsEP ap apStdout
       eep = wsEP ap apStderr
-  liftIO $ putStrLn "Initiating queues..."
   (inCh, outCh, errCh) <-
     liftIO $ (,,) <$> newTBMQueueIO 10
                   <*> newTBMQueueIO 10
@@ -665,30 +659,23 @@ getAsyncHandle ap@ThreewayProc{..} = Just <$> do
       h CloseRequest{} = liftIO close
       h e = throwM e
       h' lab e = throwM $ WebSocketError lab e
-  liftIO $ putStrLn $ "Done. Communicating with stdin: " <>  iep
   iid <- fork $ flip finally (liftIO $ atomically $ closeTBMQueue errCh) $
                 handle (h' "stdin") $ runWS iep $ \conn ->
     handle h $ flip finally (sendClose conn "") $
-    sourceTBMQueue inCh .| mapMC (\a -> liftIO (putStrLn $ "sending: " <> show a) >> return a)
-                        $$ mapM_C (sendBinaryData conn)
-  liftIO $ putStrLn $ "Done. Communicating with stdout: " <>  oep
+    sourceTBMQueue inCh $$ mapM_C (sendBinaryData conn)
   oid <- fork $ flip finally (liftIO $ atomically $ closeTBMQueue errCh) $
                 handle (h' "stdout") $ runWS oep $ \conn ->
     handle h  $ flip finally (sendClose conn "") $
-    repeatMC (receiveData conn) .| mapMC (\a -> liftIO (putStrLn $ "stdout: " <> show a) >> return a)
-                                $$ sinkTBMQueue outCh True
-  liftIO $ putStrLn $ "Done. Communicating with stderr: " <>  eep
+    repeatMC (receiveData conn) $$ sinkTBMQueue outCh True
   eid <- fork $ flip finally (liftIO $ atomically $ closeTBMQueue errCh) $
                 handle (h' "stderr") $ runWS eep $ \conn ->
     handle h  $ flip finally (sendClose conn "") $
-    repeatMC (receiveData conn) .| mapMC (\a -> liftIO (putStrLn $ "stderr: " <> show a) >> return a)
-                                $$ sinkTBMQueue errCh True
+    repeatMC (receiveData conn) $$ sinkTBMQueue errCh True
   let ahStdin  = atomically . writeTBMQueue inCh
       ahStdout = atomically $ readTBMQueue outCh
       ahStderr = atomically $ readTBMQueue errCh
       ahCloseStdin = atomically (closeTBMQueue inCh) >> killThread iid
       ahCloseProcess = mapM_ killThread [iid, oid, eid] >> close
-  liftIO $ putStrLn "Rerturning handle."
   return $ ThreeHandle {..}
 
 wsEP :: AsyncProcess -> Text -> EndPoint

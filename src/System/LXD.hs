@@ -20,7 +20,7 @@ module System.LXD ( LXDT, ContainerT, withContainer, Container
                   , readFileOrListDirFrom
                   ) where
 import           Control.Exception            (Exception)
-import           Control.Lens                 ((&), (.~))
+import           Control.Lens                 ((%~), (&), (.~), _head)
 import           Control.Monad.Catch          (MonadCatch, MonadThrow, throwM)
 import           Control.Monad.Trans          (MonadIO (..), MonadTrans (..))
 import           Control.Monad.Trans.Reader   (ReaderT (..), ask)
@@ -34,9 +34,11 @@ import           Data.Aeson.Lens              (key)
 import           Data.Aeson.Types             (camelTo2, defaultOptions)
 import           Data.Aeson.Types             (fieldLabelModifier,
                                                omitNothingFields)
+import qualified Data.Aeson.Types             as AE
 import           Data.ByteString              (ByteString)
 import qualified Data.ByteString.Char8        as BS
 import qualified Data.ByteString.Lazy.Char8   as LBS
+import qualified Data.Char                    as C
 import           Data.Default                 (Default (..))
 import           Data.HashMap.Lazy            (HashMap)
 import qualified Data.HashMap.Lazy            as HM
@@ -165,7 +167,10 @@ data AsyncClass = Task | WebSocket | Token
                 deriving (Read, Show, Eq, Ord, Enum, Generic)
 
 instance FromJSON AsyncClass where
-  parseJSON = AE.genericParseJSON defaultOptions
+  parseJSON = AE.genericParseJSON
+              defaultOptions  { AE.sumEncoding = AE.UntaggedValue
+                              , AE.constructorTagModifier = _head %~ C.toLower
+                              }
 
 
 data LXDResources = LXDResources { lxdContainers :: Maybe [Text]

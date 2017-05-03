@@ -95,6 +95,7 @@ import           Network.HTTP.Conduit            (Request (..),
                                                   RequestBody (..))
 import           Network.HTTP.Conduit            (httpLbs, parseRequest)
 import           Network.HTTP.Conduit            (responseBody,
+                                                  responseTimeoutNone,
                                                   tlsManagerSettings)
 import           Network.HTTP.Types.URI          (renderQuery)
 import           Network.Socket                  (Family (..), SockAddr (..))
@@ -567,7 +568,8 @@ waitForProcessTimeout :: (MonadIO m, MonadThrow m)
                       => Maybe Int -> AsyncProcess -> LXDT m Value
 waitForProcessTimeout mdur ap = do
   let q = maybe "" (BS.unpack . renderQuery True . pure . (,) "timeout" . Just . BS.pack . show) mdur
-  fromSync =<< get (apOperation ap <> "/wait" <> q)
+  fromSync =<< request (\r -> r { responseTimeout = responseTimeoutNone } )
+                       (apOperation ap <> "/wait" <> q)
 
 discard :: Functor f => f Value -> f ()
 discard = void
@@ -638,11 +640,12 @@ getAsyncHandle ap@InteractiveProc{..} = Just <$> do
       h CloseRequest{} = liftIO close
       h e = throwIO e
       h' lab e = throwIO $ WebSocketError lab e
-  let action = handle (h' "interactive") $ runWS ep $ \conn ->
-        handle h $ flip finally (sendClose conn "") $
-        (repeatMC (receiveData conn) $$ sinkTBMQueue outCh True)
-          `concurrently_`
-        (sourceTBMQueue inCh $$ mapM_C (sendBinaryData conn))
+  let action = flip finally (liftIO close) $
+               handle (h' "interactive") $ runWS ep $ \conn ->
+               handle h $ flip finally (sendClose conn "") $
+                 (repeatMC (receiveData conn) $$ sinkTBMQueue outCh True)
+                   `concurrently_`
+                 (sourceTBMQueue inCh $$ mapM_C (sendBinaryData conn))
   tid <- fork $ action `untilEndOf` ap
   let ahStdin  = atomically . writeTBMQueue inCh
       ahOutput = atomically $ readTBMQueue outCh

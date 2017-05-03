@@ -17,9 +17,9 @@ module System.LXD ( LXDT, ContainerT, withContainer, Container
                   , createContainer, cloneContainer, waitForProcess
                   , getProcessExitCode, cancelProcess
                   , execute, executeIn, listContainers
-                  , readAsyncProcess, readAsyncOutput
+                  , readAsyncProcess, readAsyncOutput, closeStdin
                   , sourceAsyncOutput, sourceAsyncStdout, sourceAsyncStderr
-                  , readAsyncStdout, readAsyncStderr
+                  , readAsyncStdout, readAsyncStderr, closeProcessIO
                   , writeFileBody, writeFileBodyIn, readAsyncProcessIn
                   , writeFileStr, writeFileStrIn, sinkAsyncProcess
                   , writeFileBS, writeFileBSIn, asyncStdinWriter
@@ -385,7 +385,7 @@ post ep bdy = request (\a -> a { method = "POST"
 delete :: (MonadIO m, MonadThrow m, FromJSON a) => [Char] -> LXDT m (LXDResult a)
 delete = request $ \a -> a { method = "DELETE" }
 
-closeStdin :: MonadIO m => AsyncProcess -> m ()
+closeStdin :: MonadIO m => AsyncProcess -> LXDT m ()
 closeStdin TaskProc{} = return ()
 closeStdin ap = liftIO $ ahCloseStdin $ apHandle ap
 
@@ -649,8 +649,8 @@ getAsyncHandle ap@InteractiveProc{..} = Just <$> do
   tid <- fork $ action `untilEndOf` ap
   let ahStdin  = atomically . writeTBMQueue inCh
       ahOutput = atomically $ readTBMQueue outCh
-      ahCloseStdin    = atomically $ closeTBMQueue inCh
-      ahCloseProcess  = killThread tid >> close
+      ahCloseStdin    = atomically (writeTBMQueue inCh "" >> closeTBMQueue inCh)
+      ahCloseProcess  = ahCloseStdin >> killThread tid >> close
   return $ SimpleHandle {..}
 getAsyncHandle ap@ThreewayProc{..} = Just <$> do
   let iep = wsEP ap apStdin
@@ -678,8 +678,8 @@ getAsyncHandle ap@ThreewayProc{..} = Just <$> do
   let ahStdin  = atomically . writeTBMQueue inCh
       ahStdout = atomically $ readTBMQueue outCh
       ahStderr = atomically $ readTBMQueue errCh
-      ahCloseStdin = atomically (closeTBMQueue inCh)
-      ahCloseProcess = killThread tid >> close
+      ahCloseStdin = atomically (writeTBMQueue inCh "" >> closeTBMQueue inCh)
+      ahCloseProcess = ahCloseStdin >> killThread tid >> close
   return $ ThreeHandle {..}
 
 wsEP :: AsyncProcess -> Text -> EndPoint
@@ -787,7 +787,7 @@ readAsyncProcessIn :: (MonadBaseControl IO m, MonadIO m, MonadThrow m)
 readAsyncProcessIn c cmd args input opts = do
   bracket (executeIn c cmd args opts { execInteraction = Threeway })
           (liftIO . ahCloseProcess . apHandle) $ \ap -> do
-    liftIO $ fromJust (asyncStdinWriter ap) input `finally` closeStdin ap
+    liftIO (fromJust (asyncStdinWriter ap) input) `finally` closeStdin ap
     (,) <$> (sourceAsyncStdout ap $$ sinkLazy)
         <*> (sourceAsyncStderr ap $$ sinkLazy)
 
@@ -818,5 +818,10 @@ readFileOrListDirFrom c fp = do
     _ -> throwM $ MalformedResponse (fileEndPoint c fp) $
          "File list or string expected, but got: " <> LBS.unpack (encode v)
 
+closeProcessIO :: MonadIO m => AsyncProcess -> LXDT m ()
+closeProcessIO TaskProc{} = return ()
+closeProcessIO ap = liftIO $ ahCloseProcess $ apHandle ap
+
 newtype Operation = Operation { runOperation :: String }
                deriving (Read, Show, Eq, Ord)
+

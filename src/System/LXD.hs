@@ -586,8 +586,8 @@ cancelProcess :: (MonadIO m, MonadThrow m) => AsyncProcess -> LXDT m ()
 cancelProcess ap =
   discard $ fromSync =<< delete ("operations/" <> apOperation ap)
 
-waitForProcess :: (MonadCatch m, MonadIO m) => AsyncProcess -> LXDT m ExitCode
-waitForProcess = fmap fromJust . waitForProcessTimeout Nothing
+waitForProcess :: (MonadCatch m, MonadIO m) => AsyncProcess -> LXDT m (Maybe ExitCode)
+waitForProcess = waitForProcessTimeout Nothing
 
 getProcessExitCode :: (MonadIO m, MonadThrow m) => AsyncProcess -> LXDT m (Maybe ExitCode)
 getProcessExitCode ap = do

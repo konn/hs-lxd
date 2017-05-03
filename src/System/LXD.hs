@@ -24,18 +24,19 @@ module System.LXD ( LXDT, ContainerT, withContainer, Container
                   , writeFileBody, writeFileBodyIn, readAsyncProcessIn
                   , writeFileStr, writeFileStrIn, sinkAsyncProcess
                   , writeFileBS, writeFileBSIn, asyncStdinWriter
-                  , writeFileLBS, writeFileLBSIn
+                  , writeFileLBS, writeFileLBSIn, runCommandIn, runCommand
                   , readFileOrListDirFrom, startContainer, start
                   , stopContainer, stop, killContainer, kill
                   ) where
 import           Conduit                         (Consumer, Producer, Source,
-                                                  concatC, mapM_C, repeatMC,
+                                                  concatC, mapM_C, repeatMC, sinkHandle,
                                                   repeatWhileMC, runResourceT,
                                                   sinkLazy, ($$), (.|))
 import           Control.Applicative             ((<|>))
 import           Control.Concurrent.Async.Lifted (concurrently, race_)
 import           Control.Concurrent.Lifted       (fork, killThread)
 import           Control.Concurrent.STM          (atomically)
+import System.IO (stderr,stdout)
 import           Control.Concurrent.STM          (newEmptyTMVarIO, putTMVar,
                                                   readTMVar)
 import           Control.Concurrent.STM.TBMQueue (closeTBMQueue, newTBMQueueIO,
@@ -728,6 +729,22 @@ execute :: (MonadIO m, MonadBaseControl IO m, MonadCatch m)
         => Text -> [Text] -> ExecOptions
         -> ContainerT m AsyncProcess
 execute = liftContainer3 executeIn
+
+-- | Same as execute, but maps stdout/stderr to local ones.
+runCommandIn :: (MonadIO m, MonadCatch m, MonadBaseControl IO m)
+             => Container -> Text -> [Text] -> ByteString -> ExecOptions -> LXDT m (Maybe ExitCode)
+runCommandIn c cmd args input opts = do
+  bracket (executeIn c cmd args opts { execInteraction = Threeway })
+    closeProcessIO $ \ap -> do
+    liftIO (fromMaybe (const $ return ()) (asyncStdinWriter ap) input)
+      `finally` closeStdin ap
+    snd <$> (sourceAsyncStdout ap $$ sinkHandle stdout)
+              `concurrently` (sourceAsyncStderr ap $$ sinkHandle stderr)
+              `concurrently` waitForProcess ap
+
+runCommand :: (MonadBaseControl IO m, MonadCatch m, MonadIO m)
+           => Text -> [Text] -> ByteString -> ExecOptions -> ContainerT m (Maybe ExitCode)
+runCommand = liftContainer4 runCommandIn
 
 asyncStdinWriter :: AsyncProcess -> Maybe (ByteString -> IO ())
 asyncStdinWriter TaskProc{..} = Nothing

@@ -5,9 +5,9 @@
 {-# OPTIONS_GHC -fno-warn-type-defaults #-}
 module System.LXD ( LXDT, ContainerT, withContainer, Container
                   , LXDResult(..), AsyncClass(..), LXDResources(..)
-                  , AsyncMetaData(..), LXDError(..), Device(..)
+                  , LXDError(..), Device(..)
                   , ContainerConfig(..), ContainerSource(..)
-                  , LXDStatus(..), LXDMetadata(..), Interaction(..)
+                  , LXDStatus(..), Interaction(..)
                   , LXDConfig, LXDServer(..)
                   , ExecOptions(..), ImageSpec(..), Alias, Fingerprint
                   , runLXDT, defaultExecOptions
@@ -32,7 +32,8 @@ import           Data.Aeson                   ((.=))
 import qualified Data.Aeson                   as AE
 import           Data.Aeson.Lens              (key)
 import           Data.Aeson.Types             (camelTo2, defaultOptions)
-import           Data.Aeson.Types             (fieldLabelModifier)
+import           Data.Aeson.Types             (fieldLabelModifier,
+                                               omitNothingFields)
 import           Data.ByteString              (ByteString)
 import qualified Data.ByteString.Char8        as BS
 import qualified Data.ByteString.Lazy.Char8   as LBS
@@ -45,7 +46,8 @@ import           Data.Scientific              (toBoundedInteger)
 import           Data.Text                    (Text)
 import qualified Data.Text                    as T
 import qualified Data.Text.Encoding           as T
-import           Data.Time                    (UTCTime)
+import           Data.Time                    (UTCTime, defaultTimeLocale,
+                                               parseTimeM)
 import           Data.Typeable                (Typeable)
 import           GHC.Generics                 (Generic)
 import           Network.HTTP.Client.Internal (Connection, Manager)
@@ -66,9 +68,18 @@ default (Text)
 data LXDResult a = LXDSync { lxdStatus :: LXDStatus
                            , lxdMetadata :: a
                            }
-                 | LXDAsync { lxdOperation :: Text
-                            , lxdStatus :: LXDStatus
-                            , lxdAsyncMetaData :: AsyncMetaData a
+                 | LXDAsync { lxdOperation     :: FilePath
+                            , lxdStatus        :: LXDStatus
+                            , lxdAsyncUUID :: ByteString
+                            , lxdAsyncClass :: AsyncClass
+                            , lxdAsyncCreated :: UTCTime
+                            , lxdAsyncUpdated :: UTCTime
+                            , lxdAsyncStatus  :: Text
+                            , lxdAsyncStatusCode :: Int
+                            , lxdAsyncResources :: LXDResources
+                            , lxdAsyncMetadata  :: a
+                            , lxdAsyncMayCancel :: Bool
+                            , lxdAsyncError :: Text
                             }
                  | LXDError { lxdErrorCode     :: LXDStatus
                             , lxdErrorMessage  :: Text
@@ -133,33 +144,74 @@ instance FromJSON a => FromJSON (LXDResult a) where
       "error" -> LXDError <$> obj .: "error_code"
                           <*> obj .: "error"
                           <*> obj .: "metadata"
-      "async" -> undefined
+      "async" -> do
+        lxdStatus <- obj .: "status_code"
+        lxdOperation <- obj .: "operation"
+        AsyncMetaData{ asID = UUID lxdAsyncUUID
+                     , asClass = lxdAsyncClass
+                     , asCreatedAt = LXDTime lxdAsyncCreated
+                     , asUpdatedAt = LXDTime lxdAsyncUpdated
+                     , asMetadata = lxdAsyncMetadata
+                     , asStatus   = lxdAsyncStatus
+                     , asStatusCode = lxdAsyncStatusCode
+                     , asResources = lxdAsyncResources
+                     , asMayCancel = lxdAsyncMayCancel
+                     , asErr = lxdAsyncError
+                     } <- obj .: "metadata"
+        return LXDAsync{..}
       _ -> fail ("Unknown result type: " ++ typ)
 
 data AsyncClass = Task | WebSocket | Token
-                deriving (Read, Show, Eq, Ord, Enum)
+                deriving (Read, Show, Eq, Ord, Enum, Generic)
 
-data LXDResources = LXDResources { lxdContainers :: [Text]
-                                 , lxdSnapshots  :: [Text]
-                                 , lxdImages     :: [Text]
+instance FromJSON AsyncClass where
+  parseJSON = AE.genericParseJSON defaultOptions
+
+
+data LXDResources = LXDResources { lxdContainers :: Maybe [Text]
+                                 , lxdSnapshots  :: Maybe [Text]
+                                 , lxdImages     :: Maybe [Text]
                                  }
-                 deriving (Read, Show, Eq, Ord)
+                 deriving (Read, Show, Eq, Ord, Generic)
 
-data LXDMetadata a = LXDMetadata
-                   deriving (Read, Show, Eq, Ord)
+instance FromJSON LXDResources where
+  parseJSON = AE.genericParseJSON
+              defaultOptions { fieldLabelModifier = camelTo2 '-' . drop 3
+                             , omitNothingFields  = True
+                             }
 
-data AsyncMetaData a = AsyncMetaData { asyncUUID :: ByteString
-                                     , asyncClass :: AsyncClass
-                                     , asyncCreated :: UTCTime
-                                     , asyncUpdated :: UTCTime
-                                     , asyncStatus  :: Text
-                                     , asyncStatusCode :: Int
-                                     , asyncResources :: LXDResources
-                                     , asyncMetadata  :: LXDMetadata a
-                                     , asyncMayCancel :: Bool
-                                     , asyncError :: Text
+newtype UUID = UUID ByteString
+             deriving (Read, Show, Eq, Ord)
+
+instance FromJSON UUID where
+  parseJSON = AE.withText "MD5 hash" $ pure . UUID . T.encodeUtf8
+
+newtype LXDTime = LXDTime UTCTime
+                deriving (Read, Show, Eq, Ord)
+
+instance FromJSON LXDTime where
+  parseJSON = AE.withText "Date-time in YYYY-mm-ddTHH:MM:SS.qqqqqqq-00:00" $
+    maybe (fail "illegal time format") (return . LXDTime) .
+    parseTimeM False defaultTimeLocale "%FT%T%Q%z" . T.unpack
+
+data AsyncMetaData a = AsyncMetaData { asID :: UUID
+                                     , asClass :: AsyncClass
+                                     , asCreatedAt :: LXDTime
+                                     , asUpdatedAt :: LXDTime
+                                     , asStatus  :: Text
+                                     , asStatusCode :: Int
+                                     , asResources :: LXDResources
+                                     , asMetadata  :: a
+                                     , asMayCancel :: Bool
+                                     , asErr :: Text
                                      }
-                   deriving (Read, Show, Eq, Ord)
+                   deriving (Read, Show, Eq, Ord, Generic)
+
+instance FromJSON a => FromJSON (AsyncMetaData a) where
+  parseJSON = AE.genericParseJSON
+              defaultOptions { omitNothingFields = True
+                             , fieldLabelModifier = camelTo2 '_' . drop 2
+                             }
 
 data LXDServer = Local
                | Remote { lxdServerHost :: String
@@ -266,7 +318,9 @@ data Device = Device { devPath :: FilePath
             deriving (Read, Show, Eq, Ord, Generic)
 
 instance ToJSON Device where
-  toJSON = genericToJSON defaultOptions { fieldLabelModifier = camelTo2 '_' . drop 3 }
+  toJSON = genericToJSON defaultOptions { fieldLabelModifier = camelTo2 '_' . drop 3
+                                        , omitNothingFields = True
+                                        }
 
 type Alias = Text
 type Fingerprint = ByteString
@@ -314,7 +368,9 @@ data ContainerConfig =
   deriving (Read, Show, Eq, Generic)
 
 instance ToJSON ContainerConfig where
-  toJSON = genericToJSON defaultOptions { fieldLabelModifier = camelTo2 '_' . drop 1}
+  toJSON = genericToJSON defaultOptions { fieldLabelModifier = camelTo2 '_' . drop 1
+                                        , omitNothingFields = True
+                                        }
 
 
 createContainer :: (MonadThrow m, MonadIO m) => ContainerConfig -> LXDT m (LXDResult Value)
@@ -344,7 +400,9 @@ data ExecOptions_ = ExecOptions_ { eeCommand :: [Text]
 
 instance ToJSON ExecOptions_ where
   toJSON = genericToJSON
-           defaultOptions { fieldLabelModifier = camelTo2 '-' . drop 2 }
+           defaultOptions { fieldLabelModifier = camelTo2 '-' . drop 2
+                          , omitNothingFields = True
+                          }
 
 
 data Interaction = NoInteraction

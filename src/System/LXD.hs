@@ -929,7 +929,7 @@ setContainerState c cs =
   fromAsync'$
   request (\q -> q { method = "PUT"
                    , requestBody = RequestBodyLBS $ encode cs })
-    ("/1.0/container/s" <> T.unpack c <> "/state")
+    ("/1.0/containers/" <> T.unpack c <> "/state")
 
 setState :: (MonadThrow m, MonadIO m)
          => ContainerAction -> ContainerT m AsyncProcess

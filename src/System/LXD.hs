@@ -604,8 +604,9 @@ executeIn c cmd args ExecOptions{..} = do
   (op, OpToAsync f) <-
     fromAsync =<< post ("/1.0/containers/" <> T.unpack c <> "/exec")  ExecOptions_ {..}
   let ap0 = f op
-  mah <- getAsyncHandle ap0
-  return $ maybe ap0 (\ah -> ap0 { apHandle = ah }) mah
+  -- mah <- getAsyncHandle ap0
+  -- return $ maybe ap0 (\ah -> ap0 { apHandle = ah }) mah
+  return ap0
 
 data AsyncHandle = SimpleHandle { ahStdin  :: ByteString -> IO ()
                                 , ahOutput :: IO (Maybe ByteString)

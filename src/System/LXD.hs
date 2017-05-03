@@ -8,9 +8,9 @@
 {-# OPTIONS_GHC -fno-warn-type-defaults #-}
 module System.LXD ( LXDT, ContainerT, withContainer, Container
                   , LXDResult(..), AsyncClass(..), LXDResources(..)
-                  , LXDError(..), Device(..)
+                  , LXDError(..), Device(..), defaultPermission
                   , ContainerConfig(..), ContainerSource(..)
-                  , LXDStatus(..), Interaction(..)
+                  , LXDStatus(..), Interaction(..), Permission (..)
                   , ContainerAction(..), setContainerState, setState
                   , LXDConfig, LXDServer(..), AsyncProcess
                   , ExecOptions(..), ImageSpec(..), Alias, Fingerprint
@@ -113,6 +113,7 @@ import           Network.WebSockets              (ClientApp,
                                                   runClientWithSocket,
                                                   sendBinaryData, sendClose)
 import           System.Exit                     (ExitCode (..))
+import           System.Posix.Types              (FileMode, GroupID, UserID)
 import           Wuss                            (runSecureClient)
 
 default (Text)
@@ -783,37 +784,55 @@ fileEndPoint c fp =
    let q = renderQuery True [("path", Just $ BS.pack fp)]
    in "/1.0/containers/" <> T.unpack c <> "/files" <> BS.unpack q
 
-writeFileBodyIn :: (MonadIO m, MonadThrow m)
-                => Text -> FilePath -> RequestBody -> LXDT m Value
-writeFileBodyIn c fp body =
-  fromSync =<< flip request (fileEndPoint c fp) (\r ->
-  r { method = "POST"
-    , requestBody = body
-    })
 
-writeFileBody :: (MonadThrow m, MonadIO m) => FilePath -> RequestBody -> ContainerT m Value
-writeFileBody = liftContainer2 writeFileBodyIn
+data Permission = Permission { fileUID :: Maybe UserID
+                             , fileGID :: Maybe GroupID
+                             , fileMode:: Maybe FileMode
+                             }
+                deriving (Read, Show, Eq, Ord)
+defaultPermission :: Permission
+defaultPermission = Permission Nothing Nothing Nothing
+
+instance Default Permission where
+  def = defaultPermission
+
+writeFileBody :: (MonadThrow m, MonadIO m) => FilePath -> Permission -> RequestBody -> ContainerT m Value
+writeFileBody = liftContainer3 writeFileBodyIn
+
+writeFileBodyIn :: (MonadIO m, MonadThrow m)
+                => Container -> FilePath -> Permission -> RequestBody -> LXDT m Value
+writeFileBodyIn c fp Permission{..} body =
+  let hds = [ ("X-LXD-uid", BS.pack $ show uid) | Just uid <- return fileUID ]
+         ++ [ ("X-LXD-gid", BS.pack $ show uid) | Just uid <- return fileGID ]
+         ++ [ ("X-LXD-mode", BS.pack $ show uid) | Just uid <- return fileMode ]
+  in fromSync =<< flip request (fileEndPoint c fp)
+     (\r ->
+       r { method = "POST"
+         , requestBody = body
+         , requestHeaders = hds ++ requestHeaders r
+         }
+     )
 
 writeFileStrIn :: (MonadIO m, MonadThrow m)
-            => Text -> FilePath -> String -> LXDT m Value
-writeFileStrIn c fp = writeFileBodyIn c fp . RequestBodyLBS . LBS.pack
+            => Container -> FilePath -> Permission -> String -> LXDT m Value
+writeFileStrIn c fp perm = writeFileBodyIn c fp perm . RequestBodyLBS . LBS.pack
 
 writeFileLBSIn :: (MonadIO m, MonadThrow m)
-            => Text -> FilePath -> LBS.ByteString -> LXDT m Value
-writeFileLBSIn c fp = writeFileBodyIn c fp . RequestBodyLBS
+            => Container -> FilePath -> Permission -> LBS.ByteString -> LXDT m Value
+writeFileLBSIn c perm fp = writeFileBodyIn c perm fp . RequestBodyLBS
 
 writeFileBSIn :: (MonadIO m, MonadThrow m)
-              => Text -> FilePath -> BS.ByteString -> LXDT m Value
-writeFileBSIn c fp = writeFileBodyIn c fp . RequestBodyBS
+              => Container -> FilePath -> Permission -> BS.ByteString -> LXDT m Value
+writeFileBSIn c perm fp = writeFileBodyIn c perm fp . RequestBodyBS
 
-writeFileStr :: (MonadThrow m, MonadIO m) => FilePath -> String -> ContainerT m Value
-writeFileStr = liftContainer2 writeFileStrIn
+writeFileStr :: (MonadThrow m, MonadIO m) => FilePath -> Permission -> String -> ContainerT m Value
+writeFileStr = liftContainer3 writeFileStrIn
 
-writeFileLBS :: (MonadThrow m, MonadIO m) => FilePath -> LBS.ByteString -> ContainerT m Value
-writeFileLBS = liftContainer2 writeFileLBSIn
+writeFileLBS :: (MonadThrow m, MonadIO m) => FilePath -> Permission -> LBS.ByteString -> ContainerT m Value
+writeFileLBS = liftContainer3 writeFileLBSIn
 
-writeFileBS :: (MonadThrow m, MonadIO m) => FilePath -> BS.ByteString -> ContainerT m Value
-writeFileBS = liftContainer2 writeFileBSIn
+writeFileBS :: (MonadThrow m, MonadIO m) => FilePath -> Permission -> BS.ByteString -> ContainerT m Value
+writeFileBS = liftContainer3 writeFileBSIn
 
 readAsyncProcessIn :: (MonadBaseControl IO m, MonadIO m, MonadCatch m)
                    => Container -> Text -> [Text] -> ByteString

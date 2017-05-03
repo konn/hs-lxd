@@ -604,9 +604,8 @@ executeIn c cmd args ExecOptions{..} = do
   (op, OpToAsync f) <-
     fromAsync =<< post ("/1.0/containers/" <> T.unpack c <> "/exec")  ExecOptions_ {..}
   let ap0 = f op
-  -- mah <- getAsyncHandle ap0
-  -- return $ maybe ap0 (\ah -> ap0 { apHandle = ah }) mah
-  return ap0
+  mah <- getAsyncHandle ap0
+  return $ maybe ap0 (\ah -> ap0 { apHandle = ah }) mah
 
 data AsyncHandle = SimpleHandle { ahStdin  :: ByteString -> IO ()
                                 , ahOutput :: IO (Maybe ByteString)
@@ -648,6 +647,7 @@ getAsyncHandle ap@ThreewayProc{..} = Just <$> do
   let iep = wsEP ap apStdin
       oep = wsEP ap apStdout
       eep = wsEP ap apStderr
+  liftIO $ putStrLn "Initiating queues..."
   (inCh, outCh, errCh) <-
     liftIO $ (,,) <$> newTBMQueueIO 10
                   <*> newTBMQueueIO 10
@@ -656,14 +656,17 @@ getAsyncHandle ap@ThreewayProc{..} = Just <$> do
       h ConnectionClosed = liftIO close
       h CloseRequest{} = liftIO close
       h e = throwIO e
+  liftIO $ putStrLn "Done. Communicating with stdin  WS in different thread..."
   iid <- fork $ runWS iep $ \conn ->
     handle h $ flip finally (sendClose conn "") $
     sourceTBMQueue inCh .| mapMC (\a -> liftIO (putStrLn $ "sending: " <> show a) >> return a)
                         $$ mapM_C (sendBinaryData conn)
+  liftIO $ putStrLn "Done. Communicating with stdout  WS in different thread..."
   oid <- fork $ runWS oep $ \conn ->
     handle h $ flip finally (sendClose conn "") $
     repeatMC (receiveData conn) .| mapMC (\a -> liftIO (putStrLn $ "stdout: " <> show a) >> return a)
                                 $$ sinkTBMQueue outCh True
+  liftIO $ putStrLn "Done. Communicating with stderr  WS in different thread..."
   eid <- fork $ runWS eep $ \conn ->
     handle h $ flip finally (sendClose conn "") $
     repeatMC (receiveData conn) .| mapMC (\a -> liftIO (putStrLn $ "stderr: " <> show a) >> return a)
@@ -673,6 +676,7 @@ getAsyncHandle ap@ThreewayProc{..} = Just <$> do
       ahStderr = atomically $ readTBMQueue errCh
       ahCloseStdin = atomically (closeTBMQueue inCh) >> killThread iid
       ahCloseProcess = mapM_ killThread [iid, oid, eid] >> close
+  liftIO $ putStrLn "Rerturning handle."
   return $ ThreeHandle {..}
 
 wsEP :: AsyncProcess -> Text -> EndPoint

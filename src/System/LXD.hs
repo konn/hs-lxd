@@ -44,7 +44,7 @@ import           Control.Concurrent.STM.TBMQueue (closeTBMQueue, newTBMQueueIO,
 import           Control.Exception               (Exception)
 import           Control.Exception.Lifted        (bracket, finally, handle,
                                                   throwIO)
-import           Control.Lens                    ((%~), (&), (.~), _head)
+import           Control.Lens                    ((%~), _head)
 import           Control.Monad                   (void)
 import           Control.Monad.Base              (MonadBase (..),
                                                   liftBaseDefault)
@@ -65,7 +65,6 @@ import           Data.Aeson                      (withObject, withScientific,
                                                   (.:))
 import           Data.Aeson                      ((.=))
 import qualified Data.Aeson                      as AE
-import           Data.Aeson.Lens                 (key)
 import           Data.Aeson.Types                (camelTo2, defaultOptions)
 import           Data.Aeson.Types                (fieldLabelModifier,
                                                   omitNothingFields)
@@ -485,12 +484,14 @@ instance ToJSON ImageSpec where
 data ContainerSource = SourceImage
                        { csSourceImage :: ImageSpec }
                      | SourceCopy { csContainerOnly :: Bool
-                                  , csSourceContainer :: Container
+                                  , csSource :: Container
                                   }
-                     deriving (Read, Show, Eq, Ord)
+                     deriving (Read, Show, Eq, Ord, Generic)
 
 instance ToJSON ContainerSource where
-  toJSON (SourceImage spec) = toJSON spec & key "type" .~ (toJSON "image")
+  toJSON (SourceImage spec) =
+    case toJSON spec of
+      ~(AE.Object dic) -> AE.Object $ HM.insert "type" (AE.String "image") dic
   toJSON (SourceCopy only cont) =
     object [ "type" .= "copy"
            , "container_only" .= only
@@ -525,7 +526,7 @@ cloneContainer :: (MonadIO m, MonadThrow m)
                -> LXDConfig           -- ^ misc configurations
                -> HashMap Text Device -- ^ device dictionary
                -> LXDT m (LXDResult Value)
-cloneContainer csSourceContainer cName cEphemeral csContainerOnly cConfig cDevices =
+cloneContainer csSource cName cEphemeral csContainerOnly cConfig cDevices =
   let cSource = SourceCopy{..}
       cArchitecture = Nothing
       cProfiles = []

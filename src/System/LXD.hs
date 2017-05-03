@@ -2,8 +2,8 @@
 {-# LANGUAGE FlexibleContexts, FlexibleInstances                           #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving, LambdaCase, MultiParamTypeClasses #-}
 {-# LANGUAGE NoMonomorphismRestriction, OverloadedStrings, RankNTypes      #-}
-{-# LANGUAGE RecordWildCards, TypeFamilies, UndecidableInstances           #-}
-{-# LANGUAGE ViewPatterns                                                  #-}
+{-# LANGUAGE RecordWildCards, ScopedTypeVariables, TypeFamilies            #-}
+{-# LANGUAGE UndecidableInstances, ViewPatterns                            #-}
 {-# OPTIONS_GHC -fno-warn-name-shadowing #-}
 {-# OPTIONS_GHC -fno-warn-type-defaults #-}
 module System.LXD ( LXDT, ContainerT, withContainer, Container
@@ -45,7 +45,7 @@ import           Control.Lens                    ((%~), (&), (.~), _head)
 import           Control.Monad                   (void)
 import           Control.Monad.Base              (MonadBase (..),
                                                   liftBaseDefault)
-import           Control.Monad.Catch             (MonadCatch, MonadThrow,
+import           Control.Monad.Catch             (MonadCatch, MonadThrow, catch,
                                                   throwM)
 import           Control.Monad.Trans             (MonadIO (..), MonadTrans (..))
 import           Control.Monad.Trans.Control     (MonadBaseControl (..),
@@ -564,12 +564,20 @@ instance Default ExecOptions where
 defaultExecOptions :: ExecOptions
 defaultExecOptions = def
 
-waitForProcessTimeout :: (MonadIO m, MonadThrow m)
-                      => Maybe Int -> AsyncProcess -> LXDT m Value
+waitForProcessTimeout :: (MonadIO m, MonadCatch m)
+                      => Maybe Int -> AsyncProcess -> LXDT m (Maybe ExitCode)
 waitForProcessTimeout mdur ap = do
   let q = maybe "" (BS.unpack . renderQuery True . pure . (,) "timeout" . Just . BS.pack . show) mdur
-  fromSync =<< request (\r -> r { responseTimeout = responseTimeoutNone } )
+      l = fromSync =<< request (\r -> r { responseTimeout = responseTimeoutNone } )
                        (apOperation ap <> "/wait" <> q)
+      r = fromSync =<< get (apOperation ap)
+  unwrapExitCode <$> (l `catch` \(_ :: LXDError) -> r)
+
+instance FromJSON WrappedExitCode where
+  parseJSON = withObject "Container dictionary" $ \obj ->
+    WrappedExitCode . fmap intToExitCode <$> obj AE..:? "return"
+
+newtype WrappedExitCode = WrappedExitCode { unwrapExitCode :: Maybe ExitCode }
 
 discard :: Functor f => f Value -> f ()
 discard = void
@@ -578,8 +586,8 @@ cancelProcess :: (MonadIO m, MonadThrow m) => AsyncProcess -> LXDT m ()
 cancelProcess ap =
   discard $ fromSync =<< delete ("operations/" <> apOperation ap)
 
-waitForProcess :: (MonadThrow m, MonadIO m) => AsyncProcess -> LXDT m Value
-waitForProcess = waitForProcessTimeout Nothing
+waitForProcess :: (MonadCatch m, MonadIO m) => AsyncProcess -> LXDT m ExitCode
+waitForProcess = fmap fromJust . waitForProcessTimeout Nothing
 
 getProcessExitCode :: (MonadIO m, MonadThrow m) => AsyncProcess -> LXDT m (Maybe ExitCode)
 getProcessExitCode ap = do
@@ -587,10 +595,13 @@ getProcessExitCode ap = do
   case AE.fromJSON dic of
     AE.Success dic
       | Just i <- toBoundedInteger =<< (HM.lookup "return" dic) ->
-        return $ Just $ if i == 0 then ExitSuccess else ExitFailure i
+        return $ Just $ intToExitCode i
     _ -> return Nothing
 
-executeIn :: (MonadThrow m, MonadIO m, MonadBaseControl IO m)
+intToExitCode :: Int -> ExitCode
+intToExitCode i = if i == 0 then ExitSuccess else ExitFailure i
+
+executeIn :: (MonadCatch m, MonadIO m, MonadBaseControl IO m)
           => Container -> Text -> [Text] -> ExecOptions
           -> LXDT m AsyncProcess
 executeIn c cmd args ExecOptions{..} = do
@@ -620,7 +631,7 @@ data AsyncHandle = SimpleHandle { ahStdin  :: ByteString -> IO ()
                                , ahCloseProcess :: IO ()
                                }
 
-untilEndOf :: (MonadBaseControl IO m, MonadThrow m, MonadIO m)
+untilEndOf :: (MonadBaseControl IO m, MonadCatch m, MonadIO m)
            => LXDT m a -> AsyncProcess -> LXDT m ()
 untilEndOf act ap = do
   flag <- liftIO newEmptyTMVarIO
@@ -629,7 +640,7 @@ untilEndOf act ap = do
         liftIO $ atomically (putTMVar flag ext)
   (act `concurrently_` timekeeper) `race_` liftIO (atomically $ readTMVar flag)
 
-getAsyncHandle :: (MonadBaseControl IO m, MonadThrow m, MonadIO m)
+getAsyncHandle :: (MonadBaseControl IO m, MonadCatch m, MonadIO m)
                => AsyncProcess -> LXDT m (Maybe AsyncHandle)
 getAsyncHandle TaskProc{} = return Nothing
 getAsyncHandle ap@InteractiveProc{..} = Just <$> do
@@ -691,7 +702,7 @@ wsEP ap st =
           renderQuery True [("secret", Just $ T.encodeUtf8 st)]
   in apOperation ap <> "/websocket" <> q
 
-execute :: (MonadIO m, MonadBaseControl IO m, MonadThrow m)
+execute :: (MonadIO m, MonadBaseControl IO m, MonadCatch m)
         => Text -> [Text] -> ExecOptions
         -> ContainerT m AsyncProcess
 execute = liftContainer3 executeIn
@@ -784,7 +795,7 @@ writeFileLBS = liftContainer2 writeFileLBSIn
 writeFileBS :: (MonadThrow m, MonadIO m) => FilePath -> BS.ByteString -> ContainerT m Value
 writeFileBS = liftContainer2 writeFileBSIn
 
-readAsyncProcessIn :: (MonadBaseControl IO m, MonadIO m, MonadThrow m)
+readAsyncProcessIn :: (MonadBaseControl IO m, MonadIO m, MonadCatch m)
                    => Container -> Text -> [Text] -> ByteString
                    -> ExecOptions -> LXDT m (LBS.ByteString, LBS.ByteString)
 readAsyncProcessIn c cmd args input opts = do
@@ -806,7 +817,7 @@ readAsyncOutput :: AsyncProcess -> IO (Maybe ByteString)
 readAsyncOutput InteractiveProc{..} = ahOutput apHandle
 readAsyncOutput _ = return Nothing
 
-readAsyncProcess :: (MonadThrow m, MonadIO m, MonadBaseControl IO m)
+readAsyncProcess :: (MonadCatch m, MonadIO m, MonadBaseControl IO m)
                  => Text -> [Text] -> ByteString -> ExecOptions
                  -> ContainerT m (LBS.ByteString, LBS.ByteString)
 readAsyncProcess = liftContainer4 readAsyncProcessIn

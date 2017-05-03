@@ -27,19 +27,19 @@ module System.LXD ( LXDT, ContainerT, withContainer, Container
                   , readFileOrListDirFrom
                   ) where
 import           Conduit                         (Consumer, Producer, Source,
-                                                  concatC, mapMC, mapM_C,
-                                                  repeatMC, repeatWhileMC,
-                                                  runResourceT, sinkLazy, ($$),
-                                                  (.|))
+                                                  concatC, mapM_C, repeatMC,
+                                                  repeatWhileMC, runResourceT,
+                                                  sinkLazy, ($$), (.|))
 import           Control.Applicative             ((<|>))
-import           Control.Concurrent.Async        (concurrently_)
+import           Control.Concurrent.Async.Lifted (concurrently, race_)
 import           Control.Concurrent.Lifted       (fork, killThread)
 import           Control.Concurrent.STM          (atomically)
+import           Control.Concurrent.STM          (newEmptyTMVarIO, putTMVar,
+                                                  readTMVar)
 import           Control.Concurrent.STM.TBMQueue (closeTBMQueue, newTBMQueueIO,
                                                   readTBMQueue, writeTBMQueue)
 import           Control.Exception               (Exception)
-import           Control.Exception.Lifted        (Handler (..), bracket,
-                                                  catches, finally, handle,
+import           Control.Exception.Lifted        (bracket, finally, handle,
                                                   throwIO)
 import           Control.Lens                    ((%~), (&), (.~), _head)
 import           Control.Monad                   (void)
@@ -113,6 +113,9 @@ import           System.Exit                     (ExitCode (..))
 import           Wuss                            (runSecureClient)
 
 default (Text)
+
+concurrently_ :: MonadBaseControl IO f => f a -> f b -> f ()
+concurrently_ a b = void $ concurrently  a b
 
 data LXDResult a = LXDSync { lxdStatus :: LXDStatus
                            , lxdMetadata :: a
@@ -378,17 +381,8 @@ post ep bdy = request (\a -> a { method = "POST"
                                })
                       ep
 
-put :: (ToJSON a, MonadIO m, MonadThrow m, FromJSON b) => EndPoint -> a -> LXDT m (LXDResult b)
-put ep bdy = request (\a -> a { method = "PUT"
-                               , requestBody = RequestBodyLBS $ encode bdy
-                               })
-                      ep
-
 delete :: (MonadIO m, MonadThrow m, FromJSON a) => [Char] -> LXDT m (LXDResult a)
 delete = request $ \a -> a { method = "DELETE" }
-
-asValue :: Value -> Value
-asValue = id
 
 closeStdin :: MonadIO m => AsyncProcess -> m ()
 closeStdin TaskProc{} = return ()
@@ -612,9 +606,6 @@ executeIn c cmd args ExecOptions{..} = do
   mah <- getAsyncHandle ap0
   return $ maybe ap0 (\ah -> ap0 { apHandle = ah }) mah
 
-handles :: MonadBaseControl IO m => [Handler m a] -> m a -> m a
-handles = flip catches
-
 data AsyncHandle = SimpleHandle { ahStdin  :: ByteString -> IO ()
                                 , ahOutput :: IO (Maybe ByteString)
                                 , ahCloseStdin :: IO ()
@@ -627,6 +618,15 @@ data AsyncHandle = SimpleHandle { ahStdin  :: ByteString -> IO ()
                                , ahCloseProcess :: IO ()
                                }
 
+untilEndOf :: (MonadBaseControl IO m, MonadThrow m, MonadIO m)
+           => LXDT m a -> AsyncProcess -> LXDT m ()
+untilEndOf act ap = do
+  flag <- liftIO newEmptyTMVarIO
+  let timekeeper = do
+        ext <- waitForProcess ap
+        liftIO $ atomically (putTMVar flag ext)
+  (act `concurrently_` timekeeper) `race_` liftIO (atomically $ readTMVar flag)
+
 getAsyncHandle :: (MonadBaseControl IO m, MonadThrow m, MonadIO m)
                => AsyncProcess -> LXDT m (Maybe AsyncHandle)
 getAsyncHandle TaskProc{} = return Nothing
@@ -636,12 +636,14 @@ getAsyncHandle ap@InteractiveProc{..} = Just <$> do
   let close = atomically $ closeTBMQueue inCh >> closeTBMQueue outCh
       h ConnectionClosed = liftIO close
       h CloseRequest{} = liftIO close
-      h e = throwM e
+      h e = throwIO e
       h' lab e = throwIO $ WebSocketError lab e
-  tid <- fork $ runWS ep $ \conn -> handles [Handler $ h' "interactive", Handler h] $ flip finally (sendClose conn "") $
-    (repeatMC (receiveData conn) $$ sinkTBMQueue outCh True)
-      `concurrently_`
-    (sourceTBMQueue inCh $$ mapM_C (sendBinaryData conn))
+  let action = handle (h' "interactive") $ runWS ep $ \conn ->
+        handle h $ flip finally (sendClose conn "") $
+        (repeatMC (receiveData conn) $$ sinkTBMQueue outCh True)
+          `concurrently_`
+        (sourceTBMQueue inCh $$ mapM_C (sendBinaryData conn))
+  tid <- fork $ action `untilEndOf` ap
   let ahStdin  = atomically . writeTBMQueue inCh
       ahOutput = atomically $ readTBMQueue outCh
       ahCloseStdin    = atomically $ closeTBMQueue inCh
@@ -660,20 +662,21 @@ getAsyncHandle ap@ThreewayProc{..} = Just <$> do
       h CloseRequest{} = liftIO close
       h e = throwM e
       h' lab e = throwM $ WebSocketError lab e
-  iid <- fork $ flip finally (liftIO $ atomically $ closeTBMQueue inCh) $
+      iact = flip finally (liftIO $ atomically $ closeTBMQueue inCh) $
                 handle (h' "stdin") $ runWS iep $ \conn ->
-    handle h $ sourceTBMQueue inCh $$ mapM_C (sendBinaryData conn)
-  oid <- fork $ flip finally (liftIO $ atomically $ closeTBMQueue outCh) $
+                handle h $ sourceTBMQueue inCh $$ mapM_C (sendBinaryData conn)
+      oact = flip finally (liftIO $ atomically $ closeTBMQueue outCh) $
                 handle (h' "stdout") $ runWS oep $ \conn ->
-    handle h  $ repeatMC (receiveData conn) $$ sinkTBMQueue outCh True
-  eid <- fork $ flip finally (liftIO $ atomically $ closeTBMQueue errCh) $
+                handle h  $ repeatMC (receiveData conn) $$ sinkTBMQueue outCh True
+      eact = flip finally (liftIO $ atomically $ closeTBMQueue errCh) $
                 handle (h' "stderr") $ runWS eep $ \conn ->
-    handle h  $ repeatMC (receiveData conn) $$ sinkTBMQueue errCh True
+                handle h  $ repeatMC (receiveData conn) $$ sinkTBMQueue errCh True
+  tid <- fork $ (iact `concurrently_` oact `concurrently_` eact) `untilEndOf` ap
   let ahStdin  = atomically . writeTBMQueue inCh
       ahStdout = atomically $ readTBMQueue outCh
       ahStderr = atomically $ readTBMQueue errCh
-      ahCloseStdin = atomically (closeTBMQueue inCh) >> killThread iid
-      ahCloseProcess = mapM_ killThread [iid, oid, eid] >> close
+      ahCloseStdin = atomically (closeTBMQueue inCh)
+      ahCloseProcess = killThread tid >> close
   return $ ThreeHandle {..}
 
 wsEP :: AsyncProcess -> Text -> EndPoint
@@ -737,14 +740,6 @@ liftContainer2 f a b = ContainerT $ do
   cnt <- ask
   lift $ f cnt a b
 {-# INLINE liftContainer2 #-}
-
-liftContainer :: Monad m
-              => (Container -> t -> LXDT m a)
-              -> t -> ContainerT m a
-liftContainer f a = ContainerT $ do
-  cnt <- ask
-  lift $ f cnt a
-{-# INLINE liftContainer #-}
 
 fileEndPoint :: Container -> String -> String
 fileEndPoint c fp =

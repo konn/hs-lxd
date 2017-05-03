@@ -47,8 +47,8 @@ import           Control.Lens                    ((%~), (&), (.~), _head)
 import           Control.Monad                   (void)
 import           Control.Monad.Base              (MonadBase (..),
                                                   liftBaseDefault)
-import           Control.Monad.Catch             (MonadCatch, MonadThrow, catch,
-                                                  throwM)
+import           Control.Monad.Catch             (MonadCatch, MonadMask,
+                                                  MonadThrow, catch, throwM)
 import           Control.Monad.Trans             (MonadIO (..), MonadTrans (..))
 import           Control.Monad.Trans.Control     (MonadBaseControl (..),
                                                   MonadTransControl (..),
@@ -284,7 +284,7 @@ data LXDEnv = LXDEnv Manager LXDServer
 
 newtype LXDT m a = LXDT { runLXDT_ :: ReaderT LXDEnv m a }
                  deriving (Functor, Applicative, Monad, MonadTrans,
-                           MonadIO, MonadThrow, MonadCatch)
+                           MonadIO, MonadThrow, MonadCatch, MonadMask)
 
 instance MonadBase n m => MonadBase n (LXDT m) where
   liftBase = liftBaseDefault
@@ -303,7 +303,7 @@ type Container = Text
 newtype ContainerT m a = ContainerT (ReaderT Container (LXDT m) a)
                        deriving (Functor, Applicative,
                                  Monad, MonadIO,
-                                 MonadThrow, MonadCatch
+                                 MonadThrow, MonadCatch, MonadMask
                                 )
 
 runWS :: MonadIO m => EndPoint -> ClientApp a -> LXDT m a

@@ -661,16 +661,13 @@ getAsyncHandle ap@ThreewayProc{..} = Just <$> do
       h' lab e = throwM $ WebSocketError lab e
   iid <- fork $ flip finally (liftIO $ atomically $ closeTBMQueue inCh) $
                 handle (h' "stdin") $ runWS iep $ \conn ->
-    handle h $ flip finally (sendClose conn "") $
-    sourceTBMQueue inCh $$ mapM_C (sendBinaryData conn)
+    handle h $ sourceTBMQueue inCh $$ mapM_C (sendBinaryData conn)
   oid <- fork $ flip finally (liftIO $ atomically $ closeTBMQueue outCh) $
                 handle (h' "stdout") $ runWS oep $ \conn ->
-    handle h  $ flip finally (sendClose conn "") $
-    repeatMC (receiveData conn) $$ sinkTBMQueue outCh True
+    handle h  $ repeatMC (receiveData conn) $$ sinkTBMQueue outCh True
   eid <- fork $ flip finally (liftIO $ atomically $ closeTBMQueue errCh) $
                 handle (h' "stderr") $ runWS eep $ \conn ->
-    handle h  $ flip finally (sendClose conn "") $
-    repeatMC (receiveData conn) $$ sinkTBMQueue errCh True
+    handle h  $ repeatMC (receiveData conn) $$ sinkTBMQueue errCh True
   let ahStdin  = atomically . writeTBMQueue inCh
       ahStdout = atomically $ readTBMQueue outCh
       ahStderr = atomically $ readTBMQueue errCh

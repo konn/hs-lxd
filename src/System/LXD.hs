@@ -279,10 +279,10 @@ data LXDError = MalformedResponse { errorEndPoint :: EndPoint, errorMessage :: S
 instance Exception LXDError
 
 request :: (FromJSON a, MonadThrow m, MonadIO m)
-        => (Request -> Request) -> [Char] -> LXDT m (LXDResult a)
+        => (Request -> Request) -> EndPoint -> LXDT m (LXDResult a)
 request modif ep = do
   LXDEnv man url <- LXDT ask
-  rsp <- httpLbs (modif $ fromJust $ parseRequest $ url ++ "/1.0/" ++ ep) man
+  rsp <- httpLbs (modif $ fromJust $ parseRequest $ url ++ ep) man
   either (throwM . MalformedResponse ep . (<> LBS.unpack (responseBody rsp))) return $
     eitherDecode $ responseBody rsp
 
@@ -311,7 +311,7 @@ asValue :: Value -> Value
 asValue = id
 
 listContainers :: (MonadIO m, MonadThrow m) => LXDT m [Container]
-listContainers = fromSync =<< get "containers"
+listContainers = fromSync =<< get "/1.0/containers"
 
 fromSync :: MonadThrow m => LXDResult a -> m a
 fromSync LXDSync{..} = return lxdMetadata
@@ -425,7 +425,7 @@ instance ToJSON ContainerConfig where
 
 
 createContainer :: (MonadThrow m, MonadIO m) => ContainerConfig -> LXDT m (LXDResult Value)
-createContainer = post "containers"
+createContainer = post "/1.0/containers"
 
 cloneContainer :: (MonadIO m, MonadThrow m)
                => Container           -- ^ original container name
@@ -482,7 +482,7 @@ waitForProcessTimeout :: (MonadIO m, MonadThrow m)
                       => Maybe Int -> AsyncProcess -> LXDT m Value
 waitForProcessTimeout mdur ap = do
   let q = maybe "" (BS.unpack . renderQuery True . pure . (,) "timeout" . Just . BS.pack . show) mdur
-  fromSync =<< get ("operations/" <> apOperation ap <> "/wait" <> q)
+  fromSync =<< get (apOperation ap <> "/wait" <> q)
 
 discard :: Functor f => f Value -> f ()
 discard = void
@@ -496,7 +496,7 @@ waitForProcess = waitForProcessTimeout Nothing
 
 getProcessExitCode :: (MonadIO m, MonadThrow m) => AsyncProcess -> LXDT m (Maybe ExitCode)
 getProcessExitCode ap = do
-  dic <- fromSync =<< get ("operations/" <> apOperation ap)
+  dic <- fromSync =<< get (apOperation ap)
   case AE.fromJSON dic of
     AE.Success dic
       | Just i <- toBoundedInteger =<< (HM.lookup "return" dic) ->
@@ -516,7 +516,7 @@ executeIn c cmd args ExecOptions{..} = do
           Interactive   -> (True, False, True)
           Threeway      -> (True, False, False)
   (op, OpToAsync f) <-
-    fromAsync =<< post ("containers/" <> T.unpack c <> "/exec")  ExecOptions_ {..}
+    fromAsync =<< post ("/1.0/containers/" <> T.unpack c <> "/exec")  ExecOptions_ {..}
   return $ f op
 
 data AsyncHandle = SimpleHandle { ahStdin :: ByteString -> IO ()
@@ -534,7 +534,7 @@ getAsyncHandle ThreewayProc{..} = return Nothing
 
 getWS :: (MonadThrow m, MonadIO m) => AsyncProcess -> LXDT m (Maybe Value)
 getWS TaskProc{} = return Nothing
-getWS ap = Just <$> (fromSync =<< get ("operation/" <>apOperation ap <> "/websocket"))
+getWS ap = Just <$> (fromSync =<< get (apOperation ap <> "/websocket"))
 
 execute :: (MonadIO m, MonadThrow m)
         => Text -> [Text] -> ExecOptions
@@ -568,7 +568,7 @@ liftContainer f a = ContainerT $ do
 fileEndPoint :: Container -> String -> String
 fileEndPoint c fp =
    let q = renderQuery True [("path", Just $ BS.pack fp)]
-   in "containers/" <> T.unpack c <> "/files" <> BS.unpack q
+   in "/1.0/containers/" <> T.unpack c <> "/files" <> BS.unpack q
 
 writeFileBodyIn :: (MonadIO m, MonadThrow m)
                 => Text -> FilePath -> RequestBody -> LXDT m Value

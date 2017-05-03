@@ -220,7 +220,8 @@ request :: (FromJSON a, MonadThrow m, MonadIO m)
 request modif ep = do
   LXDEnv man url <- LXDT ask
   rsp <- httpLbs (modif $ fromJust $ parseRequest $ url ++ "/1.0/" ++ ep) man
-  either (throwM . MalformedResponse) return $ eitherDecode $ responseBody rsp
+  either (throwM . MalformedResponse . (<> show (responseBody rsp))) return $
+    eitherDecode $ responseBody rsp
 
 get :: (FromJSON a, MonadThrow m, MonadIO m) => EndPoint -> LXDT m (LXDResult a)
 get = request $ \a -> a { method = "GET" }

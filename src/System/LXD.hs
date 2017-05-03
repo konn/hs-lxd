@@ -554,6 +554,8 @@ data Interaction = NoInteraction
 data ExecOptions = ExecOptions { execInteraction :: Interaction
                                , execWorkingDir  :: Maybe FilePath
                                , execEnvironment :: HashMap Text Text
+                               , execUID :: Maybe UserID
+                               , execGID :: Maybe GroupID
                                }
                  deriving (Read, Show, Eq)
 
@@ -562,6 +564,8 @@ instance Default ExecOptions where
                     , execWorkingDir  = Nothing
                     , execEnvironment =
                       HM.fromList [("PATH", "/usr/bin:/usr/local/bin:/sbin:/usr/sbin:/bin")]
+                    , execGID = Nothing
+                    , execUID = Nothing
                     }
 
 defaultExecOptions :: ExecOptions
@@ -618,7 +622,12 @@ executeIn :: (MonadCatch m, MonadIO m, MonadBaseControl IO m)
           => Container -> Text -> [Text] -> ExecOptions
           -> LXDT m AsyncProcess
 executeIn c cmd args ExecOptions{..} = do
-  let eeCommand = cmd : args
+  let eeCommand =
+        if isJust execGID || isJust execUID
+        then "sudo" : foldMap (\a -> ["-g", "#" <> T.pack (show a)]) execGID
+                   ++ foldMap (\a -> ["-u", "#" <> T.pack (show a)]) execUID
+                   ++ ("--" : cmd : args)
+        else cmd : args
       eeEnvironment = maybe id (HM.insert "PWD" . T.pack) execWorkingDir execEnvironment
       (eeWaitForWebsocket, eeRecordOutput, eeInteractive) =
         case execInteraction of

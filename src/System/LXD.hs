@@ -19,6 +19,7 @@ module System.LXD ( LXDT, ContainerT, withContainer, Container
                   , execute, executeIn, listContainers
                   , readAsyncProcess
                   , sourceAsyncOutput, sourceAsyncStdout, sourceAsyncStderr
+                  , readAsyncStdout, readAsyncStderr
                   , writeFileBody, writeFileBodyIn, readAsyncProcessIn
                   , writeFileStr, writeFileStrIn, sinkAsyncProcess
                   , writeFileBS, writeFileBSIn, asyncStdinWriter
@@ -791,6 +792,14 @@ readAsyncProcessIn c cmd args input opts = do
     liftIO $ fromJust (asyncStdinWriter ap) input `finally` closeStdin ap
     (,) <$> (sourceAsyncStdout ap $$ sinkLazy)
         <*> (sourceAsyncStderr ap $$ sinkLazy)
+
+readAsyncStdout :: AsyncProcess -> IO (Maybe ByteString)
+readAsyncStdout TaskProc{} = return Nothing
+readAsyncStdout ap = ahStdout $ apHandle ap
+
+readAsyncStderr :: AsyncProcess -> IO (Maybe ByteString)
+readAsyncStderr TaskProc{} = return Nothing
+readAsyncStderr ap = ahStderr $ apHandle ap
 
 readAsyncProcess :: (MonadThrow m, MonadIO m, MonadBaseControl IO m)
                  => Text -> [Text] -> ByteString -> ExecOptions

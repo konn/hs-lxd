@@ -643,10 +643,11 @@ getAsyncHandle ap@InteractiveProc{..} = Just <$> do
       h' lab e = throwIO $ WebSocketError lab e
   let action = flip finally (liftIO close) $
                handle (h' "interactive") $ runWS ep $ \conn ->
-               handle h $ flip finally (sendClose conn "") $
+               handle h $ flip finally (sendClose conn "") $ do
+                 sendBinaryData conn ""
                  (repeatMC (receiveData conn) $$ sinkTBMQueue outCh True)
                    `concurrently_`
-                 (sourceTBMQueue inCh $$ mapM_C (sendBinaryData conn))
+                   (sourceTBMQueue inCh $$ mapM_C (sendBinaryData conn))
   tid <- fork $ action `untilEndOf` ap
   let ahStdin  = atomically . writeTBMQueue inCh
       ahOutput = atomically $ readTBMQueue outCh

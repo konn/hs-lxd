@@ -916,7 +916,7 @@ instance ToJSON ContainerAction where
   toJSON = genericToJSON
            defaultOptions
            { AE.sumEncoding = AE.TaggedObject "action" ""
-           , AE.fieldLabelModifier = camelTo2 '_' . drop 3
+           , AE.fieldLabelModifier = (_head %~ C.toLower) .camelTo2 '_' . drop 3
            }
 
 fromAsync' :: MonadThrow m => m (LXDResult OpToAsync) -> m AsyncProcess

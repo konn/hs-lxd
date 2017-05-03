@@ -272,7 +272,7 @@ newLocalManager =
 
 type EndPoint = String
 
-data LXDError = MalformedResponse { errorMessage :: String }
+data LXDError = MalformedResponse { errorEndPoint :: EndPoint, errorMessage :: String }
               | ServerError { errorCode :: LXDStatus, errorMessage :: String }
               deriving (Read, Show, Eq, Ord, Typeable)
 
@@ -283,7 +283,7 @@ request :: (FromJSON a, MonadThrow m, MonadIO m)
 request modif ep = do
   LXDEnv man url <- LXDT ask
   rsp <- httpLbs (modif $ fromJust $ parseRequest $ url ++ "/1.0/" ++ ep) man
-  either (throwM . MalformedResponse . (<> LBS.unpack (responseBody rsp))) return $
+  either (throwM . MalformedResponse ep . (<> LBS.unpack (responseBody rsp))) return $
     eitherDecode $ responseBody rsp
 
 get :: (FromJSON a, MonadThrow m, MonadIO m) => EndPoint -> LXDT m (LXDResult a)
@@ -592,7 +592,7 @@ readFileOrListDirFrom c fp = do
   case v of
     AE.Array{}  | AE.Success val <- AE.fromJSON v -> return $ Left val
     AE.String{} | AE.Success val <- AE.fromJSON v -> return $ Right val
-    _ -> throwM $ MalformedResponse $
+    _ -> throwM $ MalformedResponse (fileEndPoint c fp) $
          "File list or string expected, but got: " <> LBS.unpack (encode v)
 
 newtype Operation = Operation { runOperation :: Text }

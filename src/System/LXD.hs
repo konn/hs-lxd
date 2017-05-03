@@ -17,7 +17,7 @@ module System.LXD ( LXDT, ContainerT, withContainer, Container
                   , createContainer, cloneContainer, waitForProcess
                   , getProcessExitCode, cancelProcess
                   , execute, executeIn, listContainers
-                  , readAsyncProcess
+                  , readAsyncProcess, readAsyncOutput
                   , sourceAsyncOutput, sourceAsyncStdout, sourceAsyncStderr
                   , readAsyncStdout, readAsyncStderr
                   , writeFileBody, writeFileBodyIn, readAsyncProcessIn
@@ -794,12 +794,16 @@ readAsyncProcessIn c cmd args input opts = do
         <*> (sourceAsyncStderr ap $$ sinkLazy)
 
 readAsyncStdout :: AsyncProcess -> IO (Maybe ByteString)
-readAsyncStdout TaskProc{} = return Nothing
-readAsyncStdout ap = ahStdout $ apHandle ap
+readAsyncStdout ThreewayProc{..} = ahStdout apHandle
+readAsyncStdout _ = return Nothing
 
 readAsyncStderr :: AsyncProcess -> IO (Maybe ByteString)
-readAsyncStderr TaskProc{} = return Nothing
-readAsyncStderr ap = ahStderr $ apHandle ap
+readAsyncStderr ThreewayProc{..} = ahStderr apHandle
+readAsyncStderr _ = return Nothing
+
+readAsyncOutput :: AsyncProcess -> IO (Maybe ByteString)
+readAsyncOutput InteractiveProc{..} = ahOutput apHandle
+readAsyncOutput _ = return Nothing
 
 readAsyncProcess :: (MonadThrow m, MonadIO m, MonadBaseControl IO m)
                  => Text -> [Text] -> ByteString -> ExecOptions

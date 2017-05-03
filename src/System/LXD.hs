@@ -665,19 +665,19 @@ getAsyncHandle ap@ThreewayProc{..} = Just <$> do
       h CloseRequest{} = liftIO close
       h e = throwM e
       h' lab e = throwM $ WebSocketError lab e
-  liftIO $ putStrLn "Done. Communicating with stdin  WS in different thread..."
+  liftIO $ putStrLn $ "Done. Communicating with stdin: " <>  iep
   iid <- fork $ flip finally (liftIO $ atomically $ closeTBMQueue errCh) $
                 handle (h' "stdin") $ runWS iep $ \conn ->
-    handles [Handler $ h' "stdin", Handler h]  $ flip finally (sendClose conn "") $
+    handle h $ flip finally (sendClose conn "") $
     sourceTBMQueue inCh .| mapMC (\a -> liftIO (putStrLn $ "sending: " <> show a) >> return a)
                         $$ mapM_C (sendBinaryData conn)
-  liftIO $ putStrLn "Done. Communicating with stdout  WS in different thread..."
+  liftIO $ putStrLn $ "Done. Communicating with stdout: " <>  oep
   oid <- fork $ flip finally (liftIO $ atomically $ closeTBMQueue errCh) $
                 handle (h' "stdout") $ runWS oep $ \conn ->
-    handles [Handler $ h' "stdout", Handler h]  $ flip finally (sendClose conn "") $
+    handle h  $ flip finally (sendClose conn "") $
     repeatMC (receiveData conn) .| mapMC (\a -> liftIO (putStrLn $ "stdout: " <> show a) >> return a)
                                 $$ sinkTBMQueue outCh True
-  liftIO $ putStrLn "Done. Communicating with stderr  WS in different thread..."
+  liftIO $ putStrLn $ "Done. Communicating with stderr: " <>  eep
   eid <- fork $ flip finally (liftIO $ atomically $ closeTBMQueue errCh) $
                 handle (h' "stderr") $ runWS eep $ \conn ->
     handle h  $ flip finally (sendClose conn "") $

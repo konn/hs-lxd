@@ -8,12 +8,12 @@ module System.LXD ( LXDT, ContainerT, withContainer, Container
                   , LXDResult(..), AsyncClass(..), LXDResources(..)
                   , LXDError(..), Device(..)
                   , ContainerConfig(..), ContainerSource(..)
-                  , LXDStatus(..), Interaction(..)
+                  , LXDStatus(..), Interaction(..), getAsyncHandle
                   , LXDConfig, LXDServer(..), AsyncProcess
                   , ExecOptions(..), ImageSpec(..), Alias, Fingerprint
                   , runLXDT, defaultExecOptions, waitForProcessTimeout
                   , createContainer, cloneContainer, waitForProcess
-                  , getProcessExitCode, cancelProcess
+                  , getProcessExitCode, cancelProcess, getWS
                   , execute, executeIn, listContainers
                   , writeFileBody, writeFileBodyIn
                   , writeFileStr, writeFileStrIn
@@ -75,7 +75,7 @@ default (Text)
 data LXDResult a = LXDSync { lxdStatus :: LXDStatus
                            , lxdMetadata :: a
                            }
-                 | LXDAsync { lxdOperation     :: FilePath
+                 | LXDAsync { lxdAsyncOperation     :: String
                             , lxdStatus        :: LXDStatus
                             , lxdAsyncUUID     :: Text
                             , lxdAsyncClass :: AsyncClass
@@ -153,7 +153,7 @@ instance FromJSON a => FromJSON (LXDResult a) where
                           <*> obj .: "metadata"
       "async" -> do
         lxdStatus <- obj .: "status_code"
-        lxdOperation <- obj .: "operation"
+        lxdAsyncOperation <- obj .: "operation"
         AsyncMetaData{ asID = lxdAsyncUUID
                      , asClass = lxdAsyncClass
                      , asCreatedAt = LXDTime lxdAsyncCreated
@@ -322,19 +322,19 @@ fromSync LXDError{..} =
   unlines [T.unpack lxdErrorMessage, LBS.unpack (encode lxdErrorMetadata)]
 
 fromAsync :: MonadThrow m => LXDResult a -> m (Operation, a)
-fromAsync LXDAsync{..} = return $ (Operation lxdAsyncUUID, lxdAsyncMetadata)
+fromAsync LXDAsync{..} = return (Operation lxdAsyncOperation, lxdAsyncMetadata)
 fromAsync LXDSync{}  =
   throwM $ MalformedResponse "" "Synchronous result returned instead of asynchronous"
 fromAsync LXDError{..} =
   throwM $ ServerError lxdErrorCode $
   unlines [T.unpack lxdErrorMessage, LBS.unpack (encode lxdErrorMetadata)]
 
-data AsyncProcess = TaskProc { apOperation :: Text }
-                  | InteractiveProc { apOperation :: Text
+data AsyncProcess = TaskProc { apOperation :: String }
+                  | InteractiveProc { apOperation :: String
                                     , apISocket :: Text
                                     , apControl :: Text
                                     }
-                  | ThreewayProc { apOperation :: Text
+                  | ThreewayProc { apOperation :: String
                                  , apStdin   :: Text
                                  , apStdout  :: Text
                                  , apStderr  :: Text
@@ -482,21 +482,21 @@ waitForProcessTimeout :: (MonadIO m, MonadThrow m)
                       => Maybe Int -> AsyncProcess -> LXDT m Value
 waitForProcessTimeout mdur ap = do
   let q = maybe "" (BS.unpack . renderQuery True . pure . (,) "timeout" . Just . BS.pack . show) mdur
-  fromSync =<< get ("operations/" <> T.unpack (apOperation ap) <> "/wait" <> q)
+  fromSync =<< get ("operations/" <> apOperation ap <> "/wait" <> q)
 
 discard :: Functor f => f Value -> f ()
 discard = void
 
 cancelProcess :: (MonadIO m, MonadThrow m) => AsyncProcess -> LXDT m ()
 cancelProcess ap =
-  discard $ fromSync =<< delete ("operations/" <> T.unpack (apOperation ap))
+  discard $ fromSync =<< delete ("operations/" <> apOperation ap)
 
 waitForProcess :: (MonadThrow m, MonadIO m) => AsyncProcess -> LXDT m Value
 waitForProcess = waitForProcessTimeout Nothing
 
 getProcessExitCode :: (MonadIO m, MonadThrow m) => AsyncProcess -> LXDT m (Maybe ExitCode)
 getProcessExitCode ap = do
-  dic <- fromSync =<< get ("operations/" <> T.unpack (apOperation ap))
+  dic <- fromSync =<< get ("operations/" <> apOperation ap)
   case AE.fromJSON dic of
     AE.Success dic
       | Just i <- toBoundedInteger =<< (HM.lookup "return" dic) ->
@@ -518,6 +518,23 @@ executeIn c cmd args ExecOptions{..} = do
   (op, OpToAsync f) <-
     fromAsync =<< post ("containers/" <> T.unpack c <> "/exec")  ExecOptions_ {..}
   return $ f op
+
+data AsyncHandle = SimpleHandle { ahStdin :: ByteString -> IO ()
+                                , ahOutput :: IO ByteString
+                                }
+                 | ThreeHandle { ahStdin :: ByteString -> IO ()
+                               , ahStdout :: IO ByteString
+                               , ahStderr :: IO ByteString
+                               }
+
+getAsyncHandle :: (MonadThrow m, MonadIO m) => AsyncProcess -> LXDT m (Maybe AsyncHandle)
+getAsyncHandle TaskProc{} = return Nothing
+getAsyncHandle InteractiveProc{..} = return Nothing
+getAsyncHandle ThreewayProc{..} = return Nothing
+
+getWS :: (MonadThrow m, MonadIO m) => AsyncProcess -> LXDT m (Maybe Value)
+getWS TaskProc{} = return Nothing
+getWS ap = Just <$> (fromSync =<< get ("operation/" <>apOperation ap <> "/websocket"))
 
 execute :: (MonadIO m, MonadThrow m)
         => Text -> [Text] -> ExecOptions
@@ -595,5 +612,5 @@ readFileOrListDirFrom c fp = do
     _ -> throwM $ MalformedResponse (fileEndPoint c fp) $
          "File list or string expected, but got: " <> LBS.unpack (encode v)
 
-newtype Operation = Operation { runOperation :: Text }
+newtype Operation = Operation { runOperation :: String }
                deriving (Read, Show, Eq, Ord)

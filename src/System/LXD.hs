@@ -1,74 +1,112 @@
-{-# OPTIONS_GHC -fno-warn-name-shadowing #-}
 {-# LANGUAGE DeriveDataTypeable, DeriveGeneric, ExtendedDefaultRules       #-}
-{-# LANGUAGE FlexibleInstances, GeneralizedNewtypeDeriving, LambdaCase     #-}
-{-# LANGUAGE NoMonomorphismRestriction, OverloadedStrings, RecordWildCards #-}
+{-# LANGUAGE FlexibleContexts, FlexibleInstances                           #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving, LambdaCase, MultiParamTypeClasses #-}
+{-# LANGUAGE NoMonomorphismRestriction, OverloadedStrings, RankNTypes      #-}
+{-# LANGUAGE RecordWildCards, TypeFamilies, UndecidableInstances           #-}
 {-# LANGUAGE ViewPatterns                                                  #-}
+{-# OPTIONS_GHC -fno-warn-name-shadowing #-}
 {-# OPTIONS_GHC -fno-warn-type-defaults #-}
 module System.LXD ( LXDT, ContainerT, withContainer, Container
                   , LXDResult(..), AsyncClass(..), LXDResources(..)
                   , LXDError(..), Device(..)
                   , ContainerConfig(..), ContainerSource(..)
-                  , LXDStatus(..), Interaction(..), getAsyncHandle
+                  , LXDStatus(..), Interaction(..)
                   , LXDConfig, LXDServer(..), AsyncProcess
                   , ExecOptions(..), ImageSpec(..), Alias, Fingerprint
                   , runLXDT, defaultExecOptions, waitForProcessTimeout
                   , createContainer, cloneContainer, waitForProcess
-                  , getProcessExitCode, cancelProcess, getWS
+                  , getProcessExitCode, cancelProcess
                   , execute, executeIn, listContainers
-                  , writeFileBody, writeFileBodyIn
-                  , writeFileStr, writeFileStrIn
-                  , writeFileBS, writeFileBSIn
+                  , readAsyncProcess
+                  , sourceAsyncOutput, sourceAsyncStdout, sourceAsyncStderr
+                  , writeFileBody, writeFileBodyIn, readAsyncProcessIn
+                  , writeFileStr, writeFileStrIn, sinkAsyncProcess
+                  , writeFileBS, writeFileBSIn, asyncStdinWriter
                   , writeFileLBS, writeFileLBSIn
                   , readFileOrListDirFrom
                   ) where
-import           Control.Applicative          ((<|>))
-import           Control.Exception            (Exception)
-import           Control.Lens                 ((%~), (&), (.~), _head)
-import           Control.Monad                (void)
-import           Control.Monad.Catch          (MonadCatch, MonadThrow, throwM)
-import           Control.Monad.Trans          (MonadIO (..), MonadTrans (..))
-import           Control.Monad.Trans.Reader   (ReaderT (..), ask)
-import           Data.Aeson                   (FromJSON (..), ToJSON (..))
-import           Data.Aeson                   (Value, eitherDecode, encode)
-import           Data.Aeson                   (genericToJSON, object)
-import           Data.Aeson                   (withObject, withScientific, (.:))
-import           Data.Aeson                   ((.=))
-import qualified Data.Aeson                   as AE
-import           Data.Aeson.Lens              (key)
-import           Data.Aeson.Types             (camelTo2, defaultOptions)
-import           Data.Aeson.Types             (fieldLabelModifier,
-                                               omitNothingFields)
-import qualified Data.Aeson.Types             as AE
-import           Data.ByteString              (ByteString)
-import qualified Data.ByteString.Char8        as BS
-import qualified Data.ByteString.Lazy.Char8   as LBS
-import qualified Data.Char                    as C
-import           Data.Default                 (Default (..))
-import           Data.HashMap.Lazy            (HashMap)
-import qualified Data.HashMap.Lazy            as HM
-import           Data.Maybe                   (fromJust, fromMaybe)
-import           Data.Monoid                  ((<>))
-import           Data.Scientific              (toBoundedInteger)
-import           Data.Text                    (Text)
-import qualified Data.Text                    as T
-import qualified Data.Text.Encoding           as T
-import           Data.Time                    (UTCTime, defaultTimeLocale,
-                                               parseTimeM)
-import           Data.Typeable                (Typeable)
-import           GHC.Generics                 (Generic)
-import           Network.HTTP.Client.Internal (Connection, Manager)
-import           Network.HTTP.Client.Internal (defaultManagerSettings)
-import           Network.HTTP.Client.Internal (makeConnection)
-import           Network.HTTP.Client.Internal (managerRawConnection, newManager)
-import           Network.HTTP.Conduit         (Request (..), RequestBody (..))
-import           Network.HTTP.Conduit         (httpLbs, parseRequest)
-import           Network.HTTP.Conduit         (responseBody, tlsManagerSettings)
-import           Network.HTTP.Types.URI       (renderQuery)
-import           Network.Socket               (Family (..), SockAddr (..))
-import           Network.Socket               (SocketType (..), close, connect)
-import           Network.Socket               (socket)
-import qualified Network.Socket.ByteString    as BSSock
-import           System.Exit                  (ExitCode (..))
+import           Conduit                         (Consumer, Producer, Source,
+                                                  concatC, mapM_C, repeatMC,
+                                                  repeatWhileMC, runResourceT,
+                                                  sinkLazy, ($$), (.|))
+import           Control.Applicative             ((<|>))
+import           Control.Concurrent.Async        (concurrently_)
+import           Control.Concurrent.Lifted       (fork, killThread)
+import           Control.Concurrent.STM          (atomically)
+import           Control.Concurrent.STM.TBMQueue (closeTBMQueue, newTBMQueueIO,
+                                                  readTBMQueue, writeTBMQueue)
+import           Control.Exception               (Exception)
+import           Control.Exception.Lifted        (bracket, finally, handle,
+                                                  throwIO)
+import           Control.Lens                    ((%~), (&), (.~), _head)
+import           Control.Monad                   (void)
+import           Control.Monad.Base              (MonadBase (..),
+                                                  liftBaseDefault)
+import           Control.Monad.Catch             (MonadCatch, MonadThrow,
+                                                  throwM)
+import           Control.Monad.Trans             (MonadIO (..), MonadTrans (..))
+import           Control.Monad.Trans.Control     (MonadBaseControl (..),
+                                                  MonadTransControl (..),
+                                                  defaultLiftBaseWith,
+                                                  defaultLiftWith,
+                                                  defaultRestoreM,
+                                                  defaultRestoreT)
+import           Control.Monad.Trans.Reader      (ReaderT (..), ask)
+import           Data.Aeson                      (FromJSON (..), ToJSON (..))
+import           Data.Aeson                      (Value, eitherDecode, encode)
+import           Data.Aeson                      (genericToJSON, object)
+import           Data.Aeson                      (withObject, withScientific,
+                                                  (.:))
+import           Data.Aeson                      ((.=))
+import qualified Data.Aeson                      as AE
+import           Data.Aeson.Lens                 (key)
+import           Data.Aeson.Types                (camelTo2, defaultOptions)
+import           Data.Aeson.Types                (fieldLabelModifier,
+                                                  omitNothingFields)
+import qualified Data.Aeson.Types                as AE
+import           Data.ByteString                 (ByteString)
+import qualified Data.ByteString.Char8           as BS
+import qualified Data.ByteString.Lazy.Char8      as LBS
+import qualified Data.Char                       as C
+import           Data.Conduit.TMChan             (mergeSources)
+import           Data.Conduit.TQueue             (sinkTBMQueue, sourceTBMQueue)
+import           Data.Default                    (Default (..))
+import           Data.HashMap.Lazy               (HashMap)
+import qualified Data.HashMap.Lazy               as HM
+import           Data.Maybe                      (fromJust, fromMaybe, isJust)
+import           Data.Monoid                     ((<>))
+import           Data.Scientific                 (toBoundedInteger)
+import           Data.Text                       (Text)
+import qualified Data.Text                       as T
+import qualified Data.Text.Encoding              as T
+import           Data.Time                       (UTCTime, defaultTimeLocale,
+                                                  parseTimeM)
+import           Data.Typeable                   (Typeable)
+import           GHC.Generics                    (Generic)
+import           Network.HTTP.Client.Internal    (Connection, Manager)
+import           Network.HTTP.Client.Internal    (defaultManagerSettings)
+import           Network.HTTP.Client.Internal    (makeConnection)
+import           Network.HTTP.Client.Internal    (managerRawConnection,
+                                                  newManager)
+import           Network.HTTP.Conduit            (Request (..),
+                                                  RequestBody (..))
+import           Network.HTTP.Conduit            (httpLbs, parseRequest)
+import           Network.HTTP.Conduit            (responseBody,
+                                                  tlsManagerSettings)
+import           Network.HTTP.Types.URI          (renderQuery)
+import           Network.Socket                  (Family (..), SockAddr (..))
+import           Network.Socket                  (SocketType (..), close,
+                                                  connect)
+import           Network.Socket                  (PortNumber, Socket, socket)
+import qualified Network.Socket.ByteString       as BSSock
+import           Network.WebSockets              (ClientApp,
+                                                  ConnectionException (..),
+                                                  defaultConnectionOptions,
+                                                  receiveData,
+                                                  runClientWithSocket,
+                                                  sendBinaryData, sendClose)
+import           System.Exit                     (ExitCode (..))
+import           Wuss                            (runSecureClient)
 
 default (Text)
 
@@ -225,18 +263,31 @@ instance FromJSON a => FromJSON (AsyncMetaData a) where
 
 data LXDServer = Local
                | Remote { lxdServerHost :: String
-                        , lxdServerPort :: Maybe Int
+                        , lxdServerPort :: Maybe PortNumber
                         , lxdClientCert :: FilePath
                         , lxdClientKey  :: FilePath
                         , lxdPassword   :: ByteString
                         }
                deriving (Read, Show, Eq, Ord)
 
-data LXDEnv = LXDEnv Manager String
+data LXDEnv = LXDEnv Manager LXDServer
 
-newtype LXDT m a = LXDT (ReaderT LXDEnv m a)
-                 deriving (Functor, Applicative, Monad,
+newtype LXDT m a = LXDT { runLXDT_ :: ReaderT LXDEnv m a }
+                 deriving (Functor, Applicative, Monad, MonadTrans,
                            MonadIO, MonadThrow, MonadCatch)
+
+instance MonadBase n m => MonadBase n (LXDT m) where
+  liftBase = liftBaseDefault
+
+instance MonadBaseControl n m => MonadBaseControl n (LXDT m) where
+  type StM (LXDT m) a = StM (ReaderT LXDEnv m) a
+  liftBaseWith = defaultLiftBaseWith
+  restoreM = defaultRestoreM
+
+instance MonadTransControl LXDT where
+  type StT LXDT a = StT (ReaderT LXDEnv) a
+  liftWith = defaultLiftWith LXDT runLXDT_
+  restoreT = defaultRestoreT LXDT
 
 type Container = Text
 newtype ContainerT m a = ContainerT (ReaderT Container (LXDT m) a)
@@ -245,21 +296,46 @@ newtype ContainerT m a = ContainerT (ReaderT Container (LXDT m) a)
                                  MonadThrow, MonadCatch
                                 )
 
+runWS :: MonadIO m => EndPoint -> ClientApp a -> LXDT m a
+runWS ep app = LXDT $ ask >>= \case
+  LXDEnv _ Local -> liftIO $ do
+    sock <- localSock
+    runClientWithSocket
+      sock "http://example.com"
+      ep
+      defaultConnectionOptions
+      []
+      app
+  LXDEnv _ Remote{..} -> liftIO $
+    runSecureClient lxdServerHost (fromMaybe 8443 lxdServerPort) ep app
+
+
+baseUrl :: Monad m => LXDT m [Char]
+baseUrl = LXDT $ ask >>= \case
+  LXDEnv _ Local -> return "http://example.com"
+  LXDEnv _ Remote{..} ->
+    return $ "https://" ++ lxdServerHost ++ maybe "" ((':':).show) lxdServerPort
+
 runLXDT :: (MonadIO m, MonadThrow m) => LXDServer -> LXDT m a -> m a
 runLXDT Local (LXDT act) = do
   man <- liftIO newLocalManager
-  runReaderT act $ LXDEnv  man "http://example.com"
-runLXDT Remote{..} (LXDT act) = do
+  runReaderT act $ LXDEnv  man Local
+runLXDT rem@Remote{..} (LXDT act) = do
   man <- liftIO $ newManager tlsManagerSettings
-  runReaderT act $ LXDEnv man $ "https://" ++ lxdServerHost ++ maybe "" ((':':).show) lxdServerPort
+  runReaderT act $ LXDEnv man rem
 
 withContainer :: Container -> ContainerT m a -> LXDT m a
 withContainer c (ContainerT act) = runReaderT act c
 
-localSock :: IO Connection
+localSock :: IO Socket
 localSock = do
   sock <- socket AF_UNIX Stream 0
   connect sock $ SockAddrUnix "/var/lib/lxd/unix.socket"
+  return sock
+
+localConn :: IO Connection
+localConn = do
+  sock <- localSock
   makeConnection (BSSock.recv sock 8192) (BSSock.sendAll sock) (close sock)
 
 newLocalManager :: IO Manager
@@ -267,7 +343,7 @@ newLocalManager =
   newManager
     defaultManagerSettings
     { managerRawConnection =
-         return $ \ _ _ _ -> localSock
+         return $ \ _ _ _ -> localConn
     }
 
 type EndPoint = String
@@ -281,7 +357,8 @@ instance Exception LXDError
 request :: (FromJSON a, MonadThrow m, MonadIO m)
         => (Request -> Request) -> EndPoint -> LXDT m (LXDResult a)
 request modif ep = do
-  LXDEnv man url <- LXDT ask
+  LXDEnv man _ <- LXDT ask
+  url <- baseUrl
   rsp <- httpLbs (modif $ fromJust $ parseRequest $ url ++ ep) man
   either (throwM . MalformedResponse ep . (<> LBS.unpack (responseBody rsp))) return $
     eitherDecode $ responseBody rsp
@@ -304,11 +381,12 @@ put ep bdy = request (\a -> a { method = "PUT"
 delete :: (MonadIO m, MonadThrow m, FromJSON a) => [Char] -> LXDT m (LXDResult a)
 delete = request $ \a -> a { method = "DELETE" }
 
-temp :: String
-temp = "https://192.168.56.2:8443"
-
 asValue :: Value -> Value
 asValue = id
+
+closeStdin :: MonadIO m => AsyncProcess -> m ()
+closeStdin TaskProc{} = return ()
+closeStdin ap = liftIO $ ahCloseStdin $ apHandle ap
 
 listContainers :: (MonadIO m, MonadThrow m) => LXDT m [Container]
 listContainers = fromSync =<< get "/1.0/containers"
@@ -333,14 +411,20 @@ data AsyncProcess = TaskProc { apOperation :: String }
                   | InteractiveProc { apOperation :: String
                                     , apISocket :: Text
                                     , apControl :: Text
+                                    , apHandle :: AsyncHandle
                                     }
                   | ThreewayProc { apOperation :: String
                                  , apStdin   :: Text
                                  , apStdout  :: Text
                                  , apStderr  :: Text
                                  , apControl :: Text
+                                 , apHandle :: AsyncHandle
                                  }
-                  deriving (Read, Show, Eq, Ord)
+                  deriving (Show)
+
+instance Show AsyncHandle where
+  showsPrec _ SimpleHandle{..} = showString "<interactive handle>"
+  showsPrec _ _ = showString "<threeway handle>"
 
 newtype OpToAsync = OpToAsync (Operation -> AsyncProcess)
 
@@ -349,6 +433,7 @@ instance FromJSON OpToAsync where
   parseJSON a = flip (AE.withObject "fd-object") a $ \obj -> do
     AE.Object fd <- obj .: "fds"
     apControl <- fd .: "control"
+    let apHandle = undefined
     let three = do
           apStdout <- fd .: "1"
           apStderr <- fd .: "2"
@@ -503,7 +588,7 @@ getProcessExitCode ap = do
         return $ Just $ if i == 0 then ExitSuccess else ExitFailure i
     _ -> return Nothing
 
-executeIn :: (MonadThrow m, MonadIO m)
+executeIn :: (MonadThrow m, MonadIO m, MonadBaseControl IO m)
           => Container -> Text -> [Text] -> ExecOptions
           -> LXDT m AsyncProcess
 executeIn c cmd args ExecOptions{..} = do
@@ -517,32 +602,114 @@ executeIn c cmd args ExecOptions{..} = do
           Threeway      -> (True, False, False)
   (op, OpToAsync f) <-
     fromAsync =<< post ("/1.0/containers/" <> T.unpack c <> "/exec")  ExecOptions_ {..}
-  return $ f op
+  let ap0 = f op
+  mah <- getAsyncHandle ap0
+  return $ maybe ap0 (\ah -> ap0 { apHandle = ah }) mah
 
-data AsyncHandle = SimpleHandle { ahStdin :: ByteString -> IO ()
-                                , ahOutput :: IO ByteString
+data AsyncHandle = SimpleHandle { ahStdin  :: ByteString -> IO ()
+                                , ahOutput :: IO (Maybe ByteString)
+                                , ahCloseStdin :: IO ()
+                                , ahCloseProcess :: IO ()
                                 }
-                 | ThreeHandle { ahStdin :: ByteString -> IO ()
-                               , ahStdout :: IO ByteString
-                               , ahStderr :: IO ByteString
+                 | ThreeHandle { ahStdin  :: ByteString -> IO ()
+                               , ahStdout :: IO (Maybe ByteString)
+                               , ahStderr :: IO (Maybe ByteString)
+                               , ahCloseStdin  :: IO ()
+                               , ahCloseProcess :: IO ()
                                }
 
-getAsyncHandle :: (MonadThrow m, MonadIO m) => AsyncProcess -> LXDT m (Maybe AsyncHandle)
+getAsyncHandle :: (MonadBaseControl IO m, MonadThrow m, MonadIO m)
+               => AsyncProcess -> LXDT m (Maybe AsyncHandle)
 getAsyncHandle TaskProc{} = return Nothing
-getAsyncHandle InteractiveProc{..} = return Nothing
-getAsyncHandle ThreewayProc{..} = return Nothing
+getAsyncHandle ap@InteractiveProc{..} = Just <$> do
+  let ep = wsEP ap apISocket
+  (inCh, outCh) <- liftIO $ (,) <$> newTBMQueueIO 10 <*> newTBMQueueIO 10
+  let close = atomically $ closeTBMQueue inCh >> closeTBMQueue outCh
+      h ConnectionClosed = liftIO close
+      h CloseRequest{} = liftIO close
+      h e = throwIO e
+  tid <- fork $ runWS ep $ \conn -> handle h $ flip finally (sendClose conn "") $
+    (repeatMC (receiveData conn) $$ sinkTBMQueue outCh True)
+      `concurrently_`
+    (sourceTBMQueue inCh $$ mapM_C (sendBinaryData conn))
+  let ahStdin  = atomically . writeTBMQueue inCh
+      ahOutput = atomically $ readTBMQueue outCh
+      ahCloseStdin    = atomically $ closeTBMQueue inCh
+      ahCloseProcess  = killThread tid >> close
+  return $ SimpleHandle {..}
+getAsyncHandle ap@ThreewayProc{..} = Just <$> do
+  let iep = wsEP ap apStdin
+      oep = wsEP ap apStdout
+      eep = wsEP ap apStderr
+  (inCh, outCh, errCh) <-
+    liftIO $ (,,) <$> newTBMQueueIO 10
+                  <*> newTBMQueueIO 10
+                  <*> newTBMQueueIO 10
+  let close = atomically $ closeTBMQueue inCh >> closeTBMQueue outCh
+      h ConnectionClosed = liftIO close
+      h CloseRequest{} = liftIO close
+      h e = throwIO e
+  iid <- fork $ runWS iep $ \conn ->
+    handle h $ flip finally (sendClose conn "") $
+    sourceTBMQueue inCh $$ mapM_C (sendBinaryData conn)
+  oid <- fork $ runWS oep $ \conn ->
+    handle h $ flip finally (sendClose conn "") $
+    repeatMC (receiveData conn) $$ sinkTBMQueue outCh True
+  eid <- fork $ runWS eep $ \conn ->
+    handle h $ flip finally (sendClose conn "") $
+    repeatMC (receiveData conn) $$ sinkTBMQueue errCh True
+  let ahStdin  = atomically . writeTBMQueue inCh
+      ahStdout = atomically $ readTBMQueue outCh
+      ahStderr = atomically $ readTBMQueue errCh
+      ahCloseStdin = atomically (closeTBMQueue inCh) >> killThread iid
+      ahCloseProcess = mapM_ killThread [iid, oid, eid] >> close
+  return $ ThreeHandle {..}
 
-getWS :: (MonadThrow m, MonadIO m) => AsyncProcess -> LXDT m (Maybe Value)
-getWS TaskProc{} = return Nothing
-getWS ap = do
+wsEP :: AsyncProcess -> Text -> EndPoint
+wsEP ap st =
   let q = BS.unpack $
           renderQuery True [("secret", Just $ T.encodeUtf8 $ apControl ap)]
-  Just <$> (fromSync =<< get (apOperation ap <> "/websocket" <> q))
+  in "/1.0/operations/" <> T.unpack st <> "/websocket" <> q
 
-execute :: (MonadIO m, MonadThrow m)
+execute :: (MonadIO m, MonadBaseControl IO m, MonadThrow m)
         => Text -> [Text] -> ExecOptions
         -> ContainerT m AsyncProcess
 execute = liftContainer3 executeIn
+
+asyncStdinWriter :: AsyncProcess -> Maybe (ByteString -> IO ())
+asyncStdinWriter TaskProc{..} = Nothing
+asyncStdinWriter ap = Just $ ahStdin $ apHandle ap
+
+sinkAsyncProcess :: MonadIO m => AsyncProcess -> Consumer ByteString m ()
+sinkAsyncProcess TaskProc{..} = mempty
+sinkAsyncProcess ap =
+  mapM_C (liftIO . ahStdin (apHandle ap))
+
+sourcePopper :: MonadIO m => IO (Maybe ByteString) -> Producer m ByteString
+sourcePopper prod = repeatWhileMC (liftIO prod) isJust .| concatC
+
+sourceAsyncOutput :: (MonadIO m, MonadThrow m, MonadBaseControl IO m)
+                  => AsyncProcess -> m (Source m ByteString)
+sourceAsyncOutput TaskProc{..} = return $ return ()
+sourceAsyncOutput InteractiveProc{..} = return $ sourcePopper $ ahOutput apHandle
+sourceAsyncOutput p@ThreewayProc{} =
+  runResourceT $ mergeSources [sourceAsyncStdout p, sourceAsyncStderr p] 20
+
+sourceAsyncStdout :: MonadIO m => AsyncProcess -> Producer m ByteString
+sourceAsyncStdout ThreewayProc{..} = sourcePopper $ ahStdout apHandle
+sourceAsyncStdout _ = return ()
+
+sourceAsyncStderr :: MonadIO m => AsyncProcess -> Producer m ByteString
+sourceAsyncStderr ThreewayProc{..} = sourcePopper $ ahStderr apHandle
+sourceAsyncStderr _ = return ()
+
+liftContainer4 :: Monad m
+               => (Container -> t3 -> t2 -> t1 -> t -> LXDT m a)
+               -> t3 -> t2 -> t1 -> t -> ContainerT m a
+liftContainer4 f d a b c = ContainerT $ do
+  cnt <- ask
+  lift $ f cnt d a b c
+{-# INLINE liftContainer4 #-}
 
 liftContainer3 :: Monad m
                => (Container -> t2 -> t1 -> t -> LXDT m a)
@@ -604,6 +771,21 @@ writeFileLBS = liftContainer2 writeFileLBSIn
 
 writeFileBS :: (MonadThrow m, MonadIO m) => FilePath -> BS.ByteString -> ContainerT m Value
 writeFileBS = liftContainer2 writeFileBSIn
+
+readAsyncProcessIn :: (MonadBaseControl IO m, MonadIO m, MonadThrow m)
+                   => Container -> Text -> [Text] -> ByteString
+                   -> ExecOptions -> LXDT m (LBS.ByteString, LBS.ByteString)
+readAsyncProcessIn c cmd args input opts = do
+  bracket (executeIn c cmd args opts { execInteraction = Threeway })
+          (liftIO . ahCloseProcess . apHandle) $ \ap -> do
+    liftIO $ fromJust (asyncStdinWriter ap) input `finally` closeStdin ap
+    (,) <$> (sourceAsyncStdout ap $$ sinkLazy)
+        <*> (sourceAsyncStderr ap $$ sinkLazy)
+
+readAsyncProcess :: (MonadThrow m, MonadIO m, MonadBaseControl IO m)
+                 => Text -> [Text] -> ByteString -> ExecOptions
+                 -> ContainerT m (LBS.ByteString, LBS.ByteString)
+readAsyncProcess = liftContainer4 readAsyncProcessIn
 
 readFileOrListDirFrom :: (MonadThrow m, MonadIO m)
                       => Container -> FilePath -> LXDT m (Either [FilePath] String)

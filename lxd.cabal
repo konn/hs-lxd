@@ -37,6 +37,16 @@ library
                      , http-types
                      , websockets
                      , transformers
+                     , wuss
+                     , websockets
+                     , lifted-base
+                     , stm
+                     , stm-conduit
+                     , stm-chans
+                     , monad-control
+                     , transformers-base
+                     , conduit-combinators
+                     , async
   default-language:    Haskell2010
 
 executable simple

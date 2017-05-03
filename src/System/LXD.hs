@@ -1,5 +1,6 @@
+{-# OPTIONS_GHC -fno-warn-name-shadowing #-}
 {-# LANGUAGE DeriveDataTypeable, DeriveGeneric, ExtendedDefaultRules       #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving, LambdaCase                        #-}
+{-# LANGUAGE FlexibleInstances, GeneralizedNewtypeDeriving, LambdaCase     #-}
 {-# LANGUAGE NoMonomorphismRestriction, OverloadedStrings, RecordWildCards #-}
 {-# LANGUAGE ViewPatterns                                                  #-}
 {-# OPTIONS_GHC -fno-warn-type-defaults #-}
@@ -8,10 +9,11 @@ module System.LXD ( LXDT, ContainerT, withContainer, Container
                   , LXDError(..), Device(..)
                   , ContainerConfig(..), ContainerSource(..)
                   , LXDStatus(..), Interaction(..)
-                  , LXDConfig, LXDServer(..)
+                  , LXDConfig, LXDServer(..), AsyncProcess
                   , ExecOptions(..), ImageSpec(..), Alias, Fingerprint
-                  , runLXDT, defaultExecOptions
-                  , createContainer, cloneContainer
+                  , runLXDT, defaultExecOptions, waitForProcessTimeout
+                  , createContainer, cloneContainer, waitForProcess
+                  , getProcessExitCode, cancelProcess
                   , execute, executeIn, listContainers
                   , writeFileBody, writeFileBodyIn
                   , writeFileStr, writeFileStrIn
@@ -19,8 +21,10 @@ module System.LXD ( LXDT, ContainerT, withContainer, Container
                   , writeFileLBS, writeFileLBSIn
                   , readFileOrListDirFrom
                   ) where
+import           Control.Applicative          ((<|>))
 import           Control.Exception            (Exception)
 import           Control.Lens                 ((%~), (&), (.~), _head)
+import           Control.Monad                (void)
 import           Control.Monad.Catch          (MonadCatch, MonadThrow, throwM)
 import           Control.Monad.Trans          (MonadIO (..), MonadTrans (..))
 import           Control.Monad.Trans.Reader   (ReaderT (..), ask)
@@ -64,6 +68,7 @@ import           Network.Socket               (Family (..), SockAddr (..))
 import           Network.Socket               (SocketType (..), close, connect)
 import           Network.Socket               (socket)
 import qualified Network.Socket.ByteString    as BSSock
+import           System.Exit                  (ExitCode (..))
 
 default (Text)
 
@@ -72,7 +77,7 @@ data LXDResult a = LXDSync { lxdStatus :: LXDStatus
                            }
                  | LXDAsync { lxdOperation     :: FilePath
                             , lxdStatus        :: LXDStatus
-                            , lxdAsyncUUID :: ByteString
+                            , lxdAsyncUUID     :: Text
                             , lxdAsyncClass :: AsyncClass
                             , lxdAsyncCreated :: UTCTime
                             , lxdAsyncUpdated :: UTCTime
@@ -149,7 +154,7 @@ instance FromJSON a => FromJSON (LXDResult a) where
       "async" -> do
         lxdStatus <- obj .: "status_code"
         lxdOperation <- obj .: "operation"
-        AsyncMetaData{ asID = UUID lxdAsyncUUID
+        AsyncMetaData{ asID = lxdAsyncUUID
                      , asClass = lxdAsyncClass
                      , asCreatedAt = LXDTime lxdAsyncCreated
                      , asUpdatedAt = LXDTime lxdAsyncUpdated
@@ -199,7 +204,7 @@ instance FromJSON LXDTime where
     maybe (fail "illegal time format") (return . LXDTime) .
     parseTimeM False defaultTimeLocale "%FT%T%Q%z" . T.unpack
 
-data AsyncMetaData a = AsyncMetaData { asID :: UUID
+data AsyncMetaData a = AsyncMetaData { asID :: Text
                                      , asClass :: AsyncClass
                                      , asCreatedAt :: LXDTime
                                      , asUpdatedAt :: LXDTime
@@ -302,6 +307,9 @@ delete = request $ \a -> a { method = "DELETE" }
 temp :: String
 temp = "https://192.168.56.2:8443"
 
+asValue :: Value -> Value
+asValue = id
+
 listContainers :: (MonadIO m, MonadThrow m) => LXDT m [Container]
 listContainers = fromSync =<< get "containers"
 
@@ -312,6 +320,44 @@ fromSync LXDAsync{}  =
 fromSync LXDError{..} =
   throwM $ ServerError lxdErrorCode $
   unlines [T.unpack lxdErrorMessage, LBS.unpack (encode lxdErrorMetadata)]
+
+fromAsync :: MonadThrow m => LXDResult a -> m (Operation, a)
+fromAsync LXDAsync{..} = return $ (Operation lxdAsyncUUID, lxdAsyncMetadata)
+fromAsync LXDSync{}  =
+  throwM $ MalformedResponse "Synchronous result returned instead of asynchronous"
+fromAsync LXDError{..} =
+  throwM $ ServerError lxdErrorCode $
+  unlines [T.unpack lxdErrorMessage, LBS.unpack (encode lxdErrorMetadata)]
+
+data AsyncProcess = TaskProc { apOperation :: Text }
+                  | InteractiveProc { apOperation :: Text
+                                    , apISocket :: Text
+                                    , apControl :: Text
+                                    }
+                  | ThreewayProc { apOperation :: Text
+                                 , apStdin   :: Text
+                                 , apStdout  :: Text
+                                 , apStderr  :: Text
+                                 , apControl :: Text
+                                 }
+                  deriving (Read, Show, Eq, Ord)
+
+newtype OpToAsync = OpToAsync (Operation -> AsyncProcess)
+
+instance FromJSON OpToAsync where
+  parseJSON AE.Null = return $ OpToAsync $ TaskProc . runOperation
+  parseJSON a = flip (AE.withObject "fd-object") a $ \obj -> do
+    AE.Object fd <- obj .: "fds"
+    apControl <- fd .: "control"
+    let three = do
+          apStdout <- fd .: "1"
+          apStderr <- fd .: "2"
+          apStdin  <- fd .: "0"
+          return $ \ (Operation apOperation) -> ThreewayProc{..}
+        inter = do
+          apISocket <- fd .: "0"
+          return $ \ (Operation apOperation) ->  InteractiveProc{..}
+    OpToAsync <$> (three <|> inter)
 
 type LXDConfig = HashMap Text Text
 
@@ -432,10 +478,35 @@ instance Default ExecOptions where
 defaultExecOptions :: ExecOptions
 defaultExecOptions = def
 
+waitForProcessTimeout :: (MonadIO m, MonadThrow m)
+                      => Maybe Int -> AsyncProcess -> LXDT m Value
+waitForProcessTimeout mdur ap = do
+  let q = maybe "" (BS.unpack . renderQuery True . pure . (,) "timeout" . Just . BS.pack . show) mdur
+  fromSync =<< get ("operations/" <> T.unpack (apOperation ap) <> "/wait" <> q)
+
+discard :: Functor f => f Value -> f ()
+discard = void
+
+cancelProcess :: (MonadIO m, MonadThrow m) => AsyncProcess -> LXDT m ()
+cancelProcess ap =
+  discard $ fromSync =<< delete ("operations/" <> T.unpack (apOperation ap))
+
+waitForProcess :: (MonadThrow m, MonadIO m) => AsyncProcess -> LXDT m Value
+waitForProcess = waitForProcessTimeout Nothing
+
+getProcessExitCode :: (MonadIO m, MonadThrow m) => AsyncProcess -> LXDT m (Maybe ExitCode)
+getProcessExitCode ap = do
+  dic <- fromSync =<< get ("operations/" <> T.unpack (apOperation ap))
+  case AE.fromJSON dic of
+    AE.Success dic
+      | Just i <- toBoundedInteger =<< (HM.lookup "return" dic) ->
+        return $ Just $ if i == 0 then ExitSuccess else ExitFailure i
+    _ -> return Nothing
+
 executeIn :: (MonadThrow m, MonadIO m)
           => Container -> Text -> [Text] -> ExecOptions
-          -> LXDT m (LXDResult Value)
-executeIn c cmd args ExecOptions{..} =
+          -> LXDT m AsyncProcess
+executeIn c cmd args ExecOptions{..} = do
   let eeCommand = cmd : args
       eeEnvironment = maybe id (HM.insert "PWD" . T.pack) execWorkingDir execEnvironment
       (eeWaitForWebsocket, eeRecordOutput, eeInteractive) =
@@ -444,15 +515,14 @@ executeIn c cmd args ExecOptions{..} =
           RecordOnly    -> (False, True, False)
           Interactive   -> (True, False, True)
           Threeway      -> (True, False, False)
-  in post ("containers/" <> T.unpack c <> "/exec") $
-     ExecOptions_ {..}
+  (op, OpToAsync f) <-
+    fromAsync =<< post ("containers/" <> T.unpack c <> "/exec")  ExecOptions_ {..}
+  return $ f op
 
 execute :: (MonadIO m, MonadThrow m)
         => Text -> [Text] -> ExecOptions
-        -> ContainerT m (LXDResult Value)
-execute cmd args opts = ContainerT $ do
-  c <- ask
-  lift $ executeIn c cmd args opts
+        -> ContainerT m AsyncProcess
+execute = liftContainer3 executeIn
 
 liftContainer3 :: Monad m
                => (Container -> t2 -> t1 -> t -> LXDT m a)
@@ -525,5 +595,5 @@ readFileOrListDirFrom c fp = do
     _ -> throwM $ MalformedResponse $
          "File list or string expected, but got: " <> LBS.unpack (encode v)
 
-data Operation = Operation
+newtype Operation = Operation { runOperation :: Text }
                deriving (Read, Show, Eq, Ord)

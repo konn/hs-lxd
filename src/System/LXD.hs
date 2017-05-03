@@ -11,6 +11,7 @@ module System.LXD ( LXDT, ContainerT, withContainer, Container
                   , LXDError(..), Device(..)
                   , ContainerConfig(..), ContainerSource(..)
                   , LXDStatus(..), Interaction(..)
+                  , ContainerAction(..), setContainerState, setState
                   , LXDConfig, LXDServer(..), AsyncProcess
                   , ExecOptions(..), ImageSpec(..), Alias, Fingerprint
                   , runLXDT, defaultExecOptions, waitForProcessTimeout
@@ -24,7 +25,8 @@ module System.LXD ( LXDT, ContainerT, withContainer, Container
                   , writeFileStr, writeFileStrIn, sinkAsyncProcess
                   , writeFileBS, writeFileBSIn, asyncStdinWriter
                   , writeFileLBS, writeFileLBSIn
-                  , readFileOrListDirFrom
+                  , readFileOrListDirFrom, startContainer, start
+                  , stopContainer, stop, killContainer, kill
                   ) where
 import           Conduit                         (Consumer, Producer, Source,
                                                   concatC, mapM_C, repeatMC,
@@ -567,17 +569,27 @@ defaultExecOptions = def
 waitForProcessTimeout :: (MonadIO m, MonadCatch m)
                       => Maybe Int -> AsyncProcess -> LXDT m (Maybe ExitCode)
 waitForProcessTimeout mdur ap = do
+  (fmap intToExitCode . maybeAEResult . AE.fromJSON =<<)
+    <$> waitForOperationTimeout mdur ap
+
+maybeAEResult :: AE.Result a -> Maybe a
+maybeAEResult (AE.Success a) = Just a
+maybeAEResult _ = Nothing
+
+waitForOperationTimeout :: (MonadIO m, MonadCatch m)
+                        => Maybe Int -> AsyncProcess -> LXDT m (Maybe Value)
+waitForOperationTimeout mdur ap = do
   let q = maybe "" (BS.unpack . renderQuery True . pure . (,) "timeout" . Just . BS.pack . show) mdur
       l = fromSync =<< request (\r -> r { responseTimeout = responseTimeoutNone } )
                        (apOperation ap <> "/wait" <> q)
       r = fromSync =<< get (apOperation ap)
-  unwrapExitCode <$> (l `catch` \(_ :: LXDError) -> r)
+  l `catch` \(_ :: LXDError) -> r
 
 instance FromJSON WrappedExitCode where
   parseJSON = withObject "Container dictionary" $ \obj ->
     WrappedExitCode . fmap intToExitCode <$> obj AE..:? "return"
 
-newtype WrappedExitCode = WrappedExitCode { unwrapExitCode :: Maybe ExitCode }
+newtype WrappedExitCode = WrappedExitCode (Maybe ExitCode)
 
 discard :: Functor f => f Value -> f ()
 discard = void
@@ -758,6 +770,14 @@ liftContainer2 f a b = ContainerT $ do
   lift $ f cnt a b
 {-# INLINE liftContainer2 #-}
 
+liftContainer :: Monad m
+               => (Container -> t -> LXDT m a)
+               -> t -> ContainerT m a
+liftContainer f a = ContainerT $ do
+  cnt <- ask
+  lift $ f cnt a
+{-# INLINE liftContainer #-}
+
 fileEndPoint :: Container -> String -> String
 fileEndPoint c fp =
    let q = renderQuery True [("path", Just $ BS.pack fp)]
@@ -836,6 +856,84 @@ closeProcessIO :: MonadIO m => AsyncProcess -> LXDT m ()
 closeProcessIO TaskProc{} = return ()
 closeProcessIO ap = liftIO $ ahCloseProcess $ apHandle ap
 
+data ContainerAction = Stop     { actTimeout :: Int
+                                , actStateful :: Bool
+                                , actForce :: Bool
+                                }
+                     | Start    { actTimeout :: Int, actStateful :: Bool }
+                     | Restart  { actTimeout :: Int, actForce :: Bool }
+                     | Freeze   { actTimeout :: Int }
+                     | Unfreeze { actTimeout :: Int }
+                     deriving (Read, Show, Eq, Ord, Generic)
+
+instance ToJSON ContainerAction where
+  toJSON = genericToJSON
+           defaultOptions
+           { AE.sumEncoding = AE.TaggedObject "action" ""
+           , AE.fieldLabelModifier = camelTo2 '_' . drop 3
+           }
+
+fromAsync' :: MonadThrow m => m (LXDResult OpToAsync) -> m AsyncProcess
+fromAsync' act = do
+  (op, OpToAsync p) <- fromAsync =<< act
+  return $ p op
+
+setContainerState :: (MonadIO m, MonadThrow m)
+                  => Container -> ContainerAction -> LXDT m AsyncProcess
+setContainerState c cs =
+  fromAsync'$
+  request (\q -> q { method = "PUT"
+                   , requestBody = RequestBodyLBS $ encode cs })
+    ("/1.0/container/s" <> T.unpack c <> "/state")
+
+setState :: (MonadThrow m, MonadIO m)
+         => ContainerAction -> ContainerT m AsyncProcess
+setState = liftContainer setContainerState
+
+startContainer :: (MonadCatch m, MonadIO m)
+               => Container
+               -> Int           -- ^ timeout
+               -> Bool          -- ^ is stateful?
+               -> LXDT m Bool
+startContainer c wait st = do
+  ap <- setContainerState c (Start wait st)
+  isJust . fmap asValue <$> waitForOperationTimeout (Just wait) ap
+
+start :: (MonadIO m, MonadCatch m) => Int -> Bool -> ContainerT m Bool
+start = liftContainer2 startContainer
+
+stopContainer :: (MonadCatch m, MonadIO m)
+              => Container
+              -> Int           -- ^ timeout
+              -> Bool          -- ^ is stateful?
+              -> LXDT m Bool
+stopContainer c wait st = do
+  ap <- setContainerState c Stop { actTimeout  = wait
+                                 , actForce    = False
+                                 , actStateful = st
+                                 }
+  isJust . fmap asValue <$> waitForOperationTimeout (Just wait) ap
+
+stop :: (MonadIO m, MonadCatch m) => Int -> Bool -> ContainerT m Bool
+stop = liftContainer2 stopContainer
+
+killContainer :: (MonadCatch m, MonadIO m)
+              => Container
+              -> Int           -- ^ timeout
+              -> Bool          -- ^ is stateful?
+              -> LXDT m Bool
+killContainer c wait st = do
+  ap <- setContainerState c Stop { actTimeout  = wait
+                                 , actForce    = True
+                                 , actStateful = st
+                                 }
+  isJust . fmap asValue <$> waitForOperationTimeout (Just wait) ap
+
+kill :: (MonadIO m, MonadCatch m) => Int -> Bool -> ContainerT m Bool
+kill = liftContainer2 killContainer
+
+asValue :: Value -> Value
+asValue = id
+
 newtype Operation = Operation { runOperation :: String }
                deriving (Read, Show, Eq, Ord)
-

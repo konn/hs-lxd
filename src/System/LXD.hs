@@ -10,7 +10,7 @@ module System.LXD ( LXDT, ContainerT, withContainer, Container
                   , LXDStatus(..), LXDMetadata(..), Interaction(..)
                   , LXDConfig, LXDServer(..)
                   , ExecOptions(..), ImageSpec(..), Alias, Fingerprint
-                  , runLXDT
+                  , runLXDT, defaultExecOptions
                   , createContainer, cloneContainer
                   , execute, executeIn, listContainers
                   , writeFileBody, writeFileBodyIn
@@ -36,6 +36,7 @@ import           Data.Aeson.Types             (fieldLabelModifier)
 import           Data.ByteString              (ByteString)
 import qualified Data.ByteString.Char8        as BS
 import qualified Data.ByteString.Lazy.Char8   as LBS
+import           Data.Default                 (Default (..))
 import           Data.HashMap.Lazy            (HashMap)
 import qualified Data.HashMap.Lazy            as HM
 import           Data.Maybe                   (fromJust, fromMaybe)
@@ -357,6 +358,16 @@ data ExecOptions = ExecOptions { execInteraction :: Interaction
                                , execEnvironment :: HashMap Text Text
                                }
                  deriving (Read, Show, Eq)
+
+instance Default ExecOptions where
+  def = ExecOptions { execInteraction = NoInteraction
+                    , execWorkingDir  = Nothing
+                    , execEnvironment =
+                      HM.fromList [("PATH", "/usr/bin:/usr/local/bin:/sbin:/usr/sbin:/bin")]
+                    }
+
+defaultExecOptions :: ExecOptions
+defaultExecOptions = def
 
 executeIn :: (MonadThrow m, MonadIO m)
           => Container -> Text -> [Text] -> ExecOptions

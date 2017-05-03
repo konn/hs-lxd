@@ -316,7 +316,7 @@ listContainers = fromSync =<< get "containers"
 fromSync :: MonadThrow m => LXDResult a -> m a
 fromSync LXDSync{..} = return lxdMetadata
 fromSync LXDAsync{}  =
-  throwM $ MalformedResponse "Asynchronous result returned instead of standard"
+  throwM $ MalformedResponse "" "Asynchronous result returned instead of standard"
 fromSync LXDError{..} =
   throwM $ ServerError lxdErrorCode $
   unlines [T.unpack lxdErrorMessage, LBS.unpack (encode lxdErrorMetadata)]
@@ -324,7 +324,7 @@ fromSync LXDError{..} =
 fromAsync :: MonadThrow m => LXDResult a -> m (Operation, a)
 fromAsync LXDAsync{..} = return $ (Operation lxdAsyncUUID, lxdAsyncMetadata)
 fromAsync LXDSync{}  =
-  throwM $ MalformedResponse "Synchronous result returned instead of asynchronous"
+  throwM $ MalformedResponse "" "Synchronous result returned instead of asynchronous"
 fromAsync LXDError{..} =
   throwM $ ServerError lxdErrorCode $
   unlines [T.unpack lxdErrorMessage, LBS.unpack (encode lxdErrorMetadata)]

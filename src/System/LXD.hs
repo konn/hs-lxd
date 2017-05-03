@@ -566,6 +566,8 @@ defaultExecOptions = def
 
 waitForProcessTimeout :: (MonadIO m, MonadThrow m)
                       => Maybe Int -> AsyncProcess -> LXDT m Value
+waitForProcessTimeout mdur TaskProc{..} = do
+  return Null
 waitForProcessTimeout mdur ap = do
   let q = maybe "" (BS.unpack . renderQuery True . pure . (,) "timeout" . Just . BS.pack . show) mdur
   fromSync =<< request (\r -> r { responseTimeout = responseTimeoutNone } )
@@ -635,6 +637,7 @@ getAsyncHandle TaskProc{} = return Nothing
 getAsyncHandle ap@InteractiveProc{..} = Just <$> do
   let ep = wsEP ap apISocket
   (inCh, outCh) <- liftIO $ (,) <$> newTBMQueueIO 10 <*> newTBMQueueIO 10
+  liftIO $ atomically $ writeTBMQueue inCh ""
   let close = atomically $ closeTBMQueue inCh >> closeTBMQueue outCh
       h ConnectionClosed = liftIO close
       h CloseRequest{} = liftIO close
@@ -660,6 +663,7 @@ getAsyncHandle ap@ThreewayProc{..} = Just <$> do
     liftIO $ (,,) <$> newTBMQueueIO 10
                   <*> newTBMQueueIO 10
                   <*> newTBMQueueIO 10
+  liftIO $ atomically $ writeTBMQueue inCh ""
   let close = atomically $ closeTBMQueue inCh >> closeTBMQueue outCh >> closeTBMQueue errCh
       h ConnectionClosed = liftIO close
       h CloseRequest{} = liftIO close

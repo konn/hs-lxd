@@ -185,7 +185,7 @@ newtype ContainerT m a = ContainerT (ReaderT Container (LXDT m) a)
 runLXDT :: (MonadIO m, MonadThrow m) => LXDServer -> LXDT m a -> m a
 runLXDT Local (LXDT act) = do
   man <- liftIO newLocalManager
-  runReaderT act $ LXDEnv  man "s"
+  runReaderT act $ LXDEnv  man "http://example.com"
 runLXDT Remote{..} (LXDT act) = do
   man <- liftIO $ newManager tlsManagerSettings
   runReaderT act $ LXDEnv man $ "https://" ++ lxdServerHost ++ maybe "" ((':':).show) lxdServerPort

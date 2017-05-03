@@ -26,9 +26,10 @@ module System.LXD ( LXDT, ContainerT, withContainer, Container
                   , readFileOrListDirFrom
                   ) where
 import           Conduit                         (Consumer, Producer, Source,
-                                                  concatC, mapM_C, repeatMC,
-                                                  repeatWhileMC, runResourceT,
-                                                  sinkLazy, ($$), (.|))
+                                                  concatC, mapMC, mapM_C,
+                                                  repeatMC, repeatWhileMC,
+                                                  runResourceT, sinkLazy, ($$),
+                                                  (.|))
 import           Control.Applicative             ((<|>))
 import           Control.Concurrent.Async        (concurrently_)
 import           Control.Concurrent.Lifted       (fork, killThread)
@@ -629,9 +630,11 @@ getAsyncHandle ap@InteractiveProc{..} = Just <$> do
       h CloseRequest{} = liftIO close
       h e = throwIO e
   tid <- fork $ runWS ep $ \conn -> handle h $ flip finally (sendClose conn "") $
-    (repeatMC (receiveData conn) $$ sinkTBMQueue outCh True)
+    (repeatMC (receiveData conn) .| mapMC (\a -> liftIO (putStrLn $ "inter: " <> show a) >> return a)
+                                 $$ sinkTBMQueue outCh True)
       `concurrently_`
-    (sourceTBMQueue inCh $$ mapM_C (sendBinaryData conn))
+    (sourceTBMQueue inCh .| mapMC (\a -> liftIO (putStrLn $ "sending: " <> show a) >> return a)
+                         $$ mapM_C (sendBinaryData conn))
   let ahStdin  = atomically . writeTBMQueue inCh
       ahOutput = atomically $ readTBMQueue outCh
       ahCloseStdin    = atomically $ closeTBMQueue inCh
@@ -651,13 +654,16 @@ getAsyncHandle ap@ThreewayProc{..} = Just <$> do
       h e = throwIO e
   iid <- fork $ runWS iep $ \conn ->
     handle h $ flip finally (sendClose conn "") $
-    sourceTBMQueue inCh $$ mapM_C (sendBinaryData conn)
+    sourceTBMQueue inCh .| mapMC (\a -> liftIO (putStrLn $ "sending: " <> show a) >> return a)
+                        $$ mapM_C (sendBinaryData conn)
   oid <- fork $ runWS oep $ \conn ->
     handle h $ flip finally (sendClose conn "") $
-    repeatMC (receiveData conn) $$ sinkTBMQueue outCh True
+    repeatMC (receiveData conn) .| mapMC (\a -> liftIO (putStrLn $ "stdout: " <> show a) >> return a)
+                                $$ sinkTBMQueue outCh True
   eid <- fork $ runWS eep $ \conn ->
     handle h $ flip finally (sendClose conn "") $
-    repeatMC (receiveData conn) $$ sinkTBMQueue errCh True
+    repeatMC (receiveData conn) .| mapMC (\a -> liftIO (putStrLn $ "stderr: " <> show a) >> return a)
+                                $$ sinkTBMQueue errCh True
   let ahStdin  = atomically . writeTBMQueue inCh
       ahStdout = atomically $ readTBMQueue outCh
       ahStderr = atomically $ readTBMQueue errCh
@@ -668,8 +674,8 @@ getAsyncHandle ap@ThreewayProc{..} = Just <$> do
 wsEP :: AsyncProcess -> Text -> EndPoint
 wsEP ap st =
   let q = BS.unpack $
-          renderQuery True [("secret", Just $ T.encodeUtf8 $ apControl ap)]
-  in "/1.0/operations/" <> T.unpack st <> "/websocket" <> q
+          renderQuery True [("secret", Just $ T.encodeUtf8 st)]
+  in apOperation ap <> "/websocket" <> q
 
 execute :: (MonadIO m, MonadBaseControl IO m, MonadThrow m)
         => Text -> [Text] -> ExecOptions

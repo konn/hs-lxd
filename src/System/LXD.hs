@@ -534,7 +534,10 @@ getAsyncHandle ThreewayProc{..} = return Nothing
 
 getWS :: (MonadThrow m, MonadIO m) => AsyncProcess -> LXDT m (Maybe Value)
 getWS TaskProc{} = return Nothing
-getWS ap = Just <$> (fromSync =<< get (apOperation ap <> "/websocket"))
+getWS ap = do
+  let q = BS.unpack $
+          renderQuery True [("secret", Just $ T.encodeUtf8 $ apControl ap)]
+  Just <$> (fromSync =<< get (apOperation ap <> "/websocket" <> q))
 
 execute :: (MonadIO m, MonadThrow m)
         => Text -> [Text] -> ExecOptions

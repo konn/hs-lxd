@@ -37,7 +37,8 @@ import           Control.Concurrent.STM          (atomically)
 import           Control.Concurrent.STM.TBMQueue (closeTBMQueue, newTBMQueueIO,
                                                   readTBMQueue, writeTBMQueue)
 import           Control.Exception               (Exception)
-import           Control.Exception.Lifted        (bracket, finally, handle,
+import           Control.Exception.Lifted        (Handler (..), bracket,
+                                                  catches, finally, handle,
                                                   throwIO)
 import           Control.Lens                    ((%~), (&), (.~), _head)
 import           Control.Monad                   (void)
@@ -102,6 +103,7 @@ import           Network.Socket                  (PortNumber, Socket, socket)
 import qualified Network.Socket.ByteString       as BSSock
 import           Network.WebSockets              (ClientApp,
                                                   ConnectionException (..),
+                                                  HandshakeException,
                                                   defaultConnectionOptions,
                                                   receiveData,
                                                   runClientWithSocket,
@@ -351,7 +353,7 @@ type EndPoint = String
 
 data LXDError = MalformedResponse { errorEndPoint :: EndPoint, errorMessage :: String }
               | ServerError { errorCode :: LXDStatus, errorMessage :: String }
-              | WebSocketError { errorPos :: String, errorWebSock :: ConnectionException
+              | WebSocketError { errorPos :: String, errorWebSock :: HandshakeException
                                }
               deriving (Show, Typeable)
 
@@ -609,6 +611,9 @@ executeIn c cmd args ExecOptions{..} = do
   mah <- getAsyncHandle ap0
   return $ maybe ap0 (\ah -> ap0 { apHandle = ah }) mah
 
+handles :: MonadBaseControl IO m => [Handler m a] -> m a -> m a
+handles = flip catches
+
 data AsyncHandle = SimpleHandle { ahStdin  :: ByteString -> IO ()
                                 , ahOutput :: IO (Maybe ByteString)
                                 , ahCloseStdin :: IO ()
@@ -630,10 +635,11 @@ getAsyncHandle ap@InteractiveProc{..} = Just <$> do
   (inCh, outCh) <- liftIO $ (,) <$> newTBMQueueIO 10 <*> newTBMQueueIO 10
   liftIO $ putStrLn "Done. Communicating with WS in different thread..."
   let close = atomically $ closeTBMQueue inCh >> closeTBMQueue outCh
-      h _ ConnectionClosed = liftIO close
-      h _ CloseRequest{} = liftIO close
-      h lab e = throwIO $ WebSocketError lab e
-  tid <- fork $ runWS ep $ \conn -> handle (h "interactive") $ flip finally (sendClose conn "") $
+      h ConnectionClosed = liftIO close
+      h CloseRequest{} = liftIO close
+      h e = throwM e
+      h' lab e = throwIO $ WebSocketError lab e
+  tid <- fork $ runWS ep $ \conn -> handles [Handler $ h' "interactive", Handler h] $ flip finally (sendClose conn "") $
     (repeatMC (receiveData conn) .| mapMC (\a -> liftIO (putStrLn $ "inter: " <> show a) >> return a)
                                  $$ sinkTBMQueue outCh True)
       `concurrently_`
@@ -655,22 +661,23 @@ getAsyncHandle ap@ThreewayProc{..} = Just <$> do
                   <*> newTBMQueueIO 10
                   <*> newTBMQueueIO 10
   let close = atomically $ closeTBMQueue inCh >> closeTBMQueue outCh
-      h _ ConnectionClosed = liftIO close
-      h _ CloseRequest{} = liftIO close
-      h lab e = throwIO $ WebSocketError lab e
+      h ConnectionClosed = liftIO close
+      h CloseRequest{} = liftIO close
+      h e = throwM e
+      h' lab e = throwIO $ WebSocketError lab e
   liftIO $ putStrLn "Done. Communicating with stdin  WS in different thread..."
   iid <- fork $ runWS iep $ \conn ->
-    handle (h "stdin") $ flip finally (sendClose conn "") $
+    handles [Handler $ h' "stdin", Handler h]  $ flip finally (sendClose conn "") $
     sourceTBMQueue inCh .| mapMC (\a -> liftIO (putStrLn $ "sending: " <> show a) >> return a)
                         $$ mapM_C (sendBinaryData conn)
   liftIO $ putStrLn "Done. Communicating with stdout  WS in different thread..."
   oid <- fork $ runWS oep $ \conn ->
-    handle (h "stdout") $ flip finally (sendClose conn "") $
+    handles [Handler $ h' "stdout", Handler h]  $ flip finally (sendClose conn "") $
     repeatMC (receiveData conn) .| mapMC (\a -> liftIO (putStrLn $ "stdout: " <> show a) >> return a)
                                 $$ sinkTBMQueue outCh True
   liftIO $ putStrLn "Done. Communicating with stderr  WS in different thread..."
   eid <- fork $ runWS eep $ \conn ->
-    handle (h "stderr") $ flip finally (sendClose conn "") $
+    handles [Handler $ h' "stderr", Handler h]  $ flip finally (sendClose conn "") $
     repeatMC (receiveData conn) .| mapMC (\a -> liftIO (putStrLn $ "stderr: " <> show a) >> return a)
                                 $$ sinkTBMQueue errCh True
   let ahStdin  = atomically . writeTBMQueue inCh

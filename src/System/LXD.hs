@@ -566,8 +566,6 @@ defaultExecOptions = def
 
 waitForProcessTimeout :: (MonadIO m, MonadThrow m)
                       => Maybe Int -> AsyncProcess -> LXDT m Value
-waitForProcessTimeout mdur TaskProc{..} = do
-  return Null
 waitForProcessTimeout mdur ap = do
   let q = maybe "" (BS.unpack . renderQuery True . pure . (,) "timeout" . Just . BS.pack . show) mdur
   fromSync =<< request (\r -> r { responseTimeout = responseTimeoutNone } )

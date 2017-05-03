@@ -304,7 +304,7 @@ runWS ep app = LXDT $ ask >>= \case
   LXDEnv _ Local -> liftIO $ do
     sock <- localSock
     runClientWithSocket
-      sock "ws://example.com"
+      sock "[::]"
       ep
       defaultConnectionOptions
       []

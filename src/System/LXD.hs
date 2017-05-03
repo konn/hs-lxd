@@ -163,7 +163,7 @@ instance FromJSON a => FromJSON (LXDResult a) where
         return LXDAsync{..}
       _ -> fail ("Unknown result type: " ++ typ)
 
-data AsyncClass = Task | WebSocket | Token
+data AsyncClass = Task | Websocket | Token
                 deriving (Read, Show, Eq, Ord, Enum, Generic)
 
 instance FromJSON AsyncClass where

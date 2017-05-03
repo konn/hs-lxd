@@ -624,7 +624,9 @@ getAsyncHandle :: (MonadBaseControl IO m, MonadThrow m, MonadIO m)
 getAsyncHandle TaskProc{} = return Nothing
 getAsyncHandle ap@InteractiveProc{..} = Just <$> do
   let ep = wsEP ap apISocket
+  liftIO $ putStrLn "Initiating queues..."
   (inCh, outCh) <- liftIO $ (,) <$> newTBMQueueIO 10 <*> newTBMQueueIO 10
+  liftIO $ putStrLn "Done. Communicating with WS in different thread..."
   let close = atomically $ closeTBMQueue inCh >> closeTBMQueue outCh
       h ConnectionClosed = liftIO close
       h CloseRequest{} = liftIO close
@@ -639,6 +641,7 @@ getAsyncHandle ap@InteractiveProc{..} = Just <$> do
       ahOutput = atomically $ readTBMQueue outCh
       ahCloseStdin    = atomically $ closeTBMQueue inCh
       ahCloseProcess  = killThread tid >> close
+  liftIO $ putStrLn "Rerturning handle."
   return $ SimpleHandle {..}
 getAsyncHandle ap@ThreewayProc{..} = Just <$> do
   let iep = wsEP ap apStdin

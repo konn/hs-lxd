@@ -957,7 +957,7 @@ startContainer :: (MonadIO m, MonadCatch m, MonadBaseControl IO m)
                -> LXDT m ()
 startContainer c wait st = do
   ap <- setContainerState c (Start wait st)
-  void $ fmap asValue <$> waitForOperationTimeout (Just wait) ap
+  void $ fmap asValue <$> waitForOperationTimeout Nothing ap
 
 start :: (MonadIO m, MonadCatch m, MonadBaseControl IO m) => Int -> Bool -> ContainerT m ()
 start = liftContainer2 startContainer

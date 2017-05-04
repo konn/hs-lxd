@@ -520,8 +520,7 @@ createContainer :: (MonadCatch m, MonadBaseControl IO m, MonadIO m)
                 => ContainerConfig -> LXDT m ()
 createContainer c = do
   ap <- fromAsync' $ post "/1.0/containers" c
-  liftIO $ atomically $ readTMVar $ apExitCode ap
-  return ()
+  void $ waitForOperationTimeout Nothing ap
 
 cloneContainer :: (MonadIO m, MonadCatch m, MonadBaseControl IO m)
                => Container           -- ^ original container name

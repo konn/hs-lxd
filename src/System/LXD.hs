@@ -573,8 +573,11 @@ defaultExecOptions = def
 waitForProcessTimeout :: (MonadIO m, MonadCatch m)
                       => Maybe Int -> AsyncProcess -> LXDT m (Maybe ExitCode)
 waitForProcessTimeout mdur ap = do
-  (fmap intToExitCode . maybeAEResult . AE.fromJSON =<<)
+  n <- (fmap intToExitCode . maybeAEResult . AE.fromJSON =<<)
     <$> waitForOperationTimeout mdur ap
+  case n of
+    Just{} -> return n
+    Nothing -> getProcessExitCode ap
 
 maybeAEResult :: AE.Result a -> Maybe a
 maybeAEResult (AE.Success a) = Just a

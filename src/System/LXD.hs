@@ -452,15 +452,12 @@ type LXDConfig = HashMap Text Text
 
 type DevType = Text
 
-data Device = Device { devPath :: FilePath
-                     , devType :: DevType
-                     }
-            deriving (Read, Show, Eq, Ord, Generic)
+type Device = HashMap Text Text
 
-instance ToJSON Device where
-  toJSON = genericToJSON defaultOptions { fieldLabelModifier = camelTo2 '_' . drop 3
-                                        , omitNothingFields = True
-                                        }
+-- instance ToJSON Device where
+--   toJSON = genericToJSON defaultOptions { fieldLabelModifier = camelTo2 '_' . drop 3
+--                                         , omitNothingFields = True
+--                                         }
 
 type Alias = Text
 type Fingerprint = ByteString

@@ -49,8 +49,8 @@ import           Control.Monad                   (void, (<=<))
 import Data.Aeson.Lens (key)
 import           Control.Monad.Base              (MonadBase (..),
                                                   liftBaseDefault)
-import           Control.Monad.Catch             (MonadCatch, MonadMask,onException,
-                                                  MonadThrow, catch, throwM)
+import           Control.Monad.Catch             (MonadThrow, MonadMask,onException,
+                                                  MonadCatch, catch, throwM)
 import           Control.Monad.Trans             (MonadIO (..), MonadTrans (..))
 import           Control.Monad.Trans.Control     (MonadBaseControl (..),
                                                   MonadTransControl (..),
@@ -286,7 +286,7 @@ data LXDEnv = LXDEnv Manager LXDServer
 
 newtype LXDT m a = LXDT { runLXDT_ :: ReaderT LXDEnv m a }
                  deriving (Functor, Applicative, Monad, MonadTrans,
-                           MonadIO, MonadThrow, MonadCatch, MonadMask)
+                           MonadIO, MonadCatch, MonadThrow, MonadMask)
 
 instance MonadBase n m => MonadBase n (LXDT m) where
   liftBase = liftBaseDefault
@@ -305,7 +305,7 @@ type Container = Text
 newtype ContainerT m a = ContainerT (ReaderT Container (LXDT m) a)
                        deriving (Functor, Applicative,
                                  Monad, MonadIO,
-                                 MonadThrow, MonadCatch, MonadMask
+                                 MonadCatch, MonadThrow, MonadMask
                                 )
 
 runWS :: MonadIO m => EndPoint -> ClientApp a -> LXDT m a
@@ -328,7 +328,7 @@ baseUrl = LXDT $ ask >>= \case
   LXDEnv _ Remote{..} ->
     return $ "https://" ++ lxdServerHost ++ maybe "" ((':':).show) lxdServerPort
 
-runLXDT :: (MonadIO m, MonadThrow m) => LXDServer -> LXDT m a -> m a
+runLXDT :: (MonadIO m, MonadCatch m) => LXDServer -> LXDT m a -> m a
 runLXDT Local (LXDT act) = do
   man <- liftIO newLocalManager
   runReaderT act $ LXDEnv  man Local
@@ -368,7 +368,7 @@ data LXDError = MalformedResponse { errorEndPoint :: EndPoint, errorMessage :: S
 
 instance Exception LXDError
 
-request :: (FromJSON a, MonadThrow m, MonadIO m)
+request :: (FromJSON a, MonadCatch m, MonadIO m)
         => (Request -> Request) -> EndPoint -> LXDT m (LXDResult a)
 request modif ep = do
   LXDEnv man _ <- LXDT ask
@@ -377,26 +377,26 @@ request modif ep = do
   either (throwM . MalformedResponse ep . (<> LBS.unpack (responseBody rsp))) return $
     eitherDecode $ responseBody rsp
 
-get :: (FromJSON a, MonadThrow m, MonadIO m) => EndPoint -> LXDT m (LXDResult a)
+get :: (FromJSON a, MonadCatch m, MonadIO m) => EndPoint -> LXDT m (LXDResult a)
 get = request $ \a -> a { method = "GET" }
 
-post :: (ToJSON a, MonadIO m, MonadThrow m, FromJSON b) => EndPoint -> a -> LXDT m (LXDResult b)
+post :: (ToJSON a, MonadIO m, MonadCatch m, FromJSON b) => EndPoint -> a -> LXDT m (LXDResult b)
 post ep bdy = request (\a -> a { method = "POST"
                                , requestBody = RequestBodyLBS $ encode bdy
                                })
                       ep
 
-delete :: (MonadIO m, MonadThrow m, FromJSON a) => [Char] -> LXDT m (LXDResult a)
+delete :: (MonadIO m, MonadCatch m, FromJSON a) => [Char] -> LXDT m (LXDResult a)
 delete = request $ \a -> a { method = "DELETE" }
 
 closeStdin :: MonadIO m => AsyncProcess -> LXDT m ()
 closeStdin TaskProc{} = return ()
 closeStdin ap = liftIO $ ahCloseStdin $ apHandle ap
 
-listContainers :: (MonadIO m, MonadThrow m) => LXDT m [Container]
+listContainers :: (MonadIO m, MonadCatch m) => LXDT m [Container]
 listContainers = fromSync =<< get "/1.0/containers"
 
-fromSync :: MonadThrow m => LXDResult a -> m a
+fromSync :: MonadCatch m => LXDResult a -> m a
 fromSync LXDSync{..} = return lxdMetadata
 fromSync LXDAsync{}  =
   throwM $ MalformedResponse "" "Asynchronous result returned instead of standard"
@@ -404,7 +404,7 @@ fromSync LXDError{..} =
   throwM $ ServerError lxdErrorCode $
   unlines [T.unpack lxdErrorMessage, LBS.unpack (encode lxdErrorMetadata)]
 
-fromAsync :: MonadThrow m => LXDResult a -> m (Operation, a)
+fromAsync :: MonadCatch m => LXDResult a -> m (Operation, a)
 fromAsync LXDAsync{..} = return (Operation lxdAsyncOperation, lxdAsyncMetadata)
 fromAsync LXDSync{}  =
   throwM $ MalformedResponse "" "Synchronous result returned instead of asynchronous"
@@ -516,10 +516,14 @@ instance ToJSON ContainerConfig where
                                         }
 
 
-createContainer :: (MonadThrow m, MonadIO m) => ContainerConfig -> LXDT m ()
-createContainer = void . fmap (asValue . snd) . fromAsync <=< post "/1.0/containers"
+createContainer :: (MonadCatch m, MonadBaseControl IO m, MonadIO m)
+                => ContainerConfig -> LXDT m ()
+createContainer c = do
+  ap <- fromAsync' $ post "/1.0/containers" c
+  liftIO $ atomically $ readTMVar $ apExitCode ap
+  return ()
 
-cloneContainer :: (MonadIO m, MonadThrow m)
+cloneContainer :: (MonadIO m, MonadCatch m, MonadBaseControl IO m)
                => Container           -- ^ original container name
                -> Container           -- ^ new copied container name
                -> Bool                -- ^ is ephemeral?
@@ -605,14 +609,14 @@ newtype WrappedExitCode = WrappedExitCode (Maybe ExitCode)
 discard :: Functor f => f Value -> f ()
 discard = void
 
-cancelProcess :: (MonadIO m, MonadThrow m) => AsyncProcess -> LXDT m ()
+cancelProcess :: (MonadIO m, MonadCatch m) => AsyncProcess -> LXDT m ()
 cancelProcess ap =
   discard $ fromSync =<< delete ("operations/" <> apOperation ap)
 
 waitForProcess :: (MonadCatch m, MonadIO m) => AsyncProcess -> LXDT m (Maybe ExitCode)
 waitForProcess = waitForProcessTimeout Nothing
 
-getProcessExitCode :: (MonadIO m, MonadThrow m) => AsyncProcess -> LXDT m (Maybe ExitCode)
+getProcessExitCode :: (MonadIO m, MonadCatch m) => AsyncProcess -> LXDT m (Maybe ExitCode)
 getProcessExitCode TaskProc{} = return Nothing
 getProcessExitCode ap = liftIO $ atomically $ tryReadTMVar $ apExitCode ap
 
@@ -758,7 +762,7 @@ sinkAsyncProcess ap =
 sourcePopper :: MonadIO m => IO (Maybe ByteString) -> Producer m ByteString
 sourcePopper prod = repeatWhileMC (liftIO prod) isJust .| concatC
 
-sourceAsyncOutput :: (MonadIO m, MonadThrow m, MonadBaseControl IO m)
+sourceAsyncOutput :: (MonadIO m, MonadCatch m, MonadBaseControl IO m)
                   => AsyncProcess -> m (Source m ByteString)
 sourceAsyncOutput TaskProc{..} = return $ return ()
 sourceAsyncOutput InteractiveProc{..} = return $ sourcePopper $ ahOutput apHandle
@@ -822,10 +826,10 @@ defaultPermission = Permission Nothing Nothing Nothing
 instance Default Permission where
   def = defaultPermission
 
-writeFileBody :: (MonadThrow m, MonadIO m) => FilePath -> Permission -> RequestBody -> ContainerT m Value
+writeFileBody :: (MonadCatch m, MonadIO m) => FilePath -> Permission -> RequestBody -> ContainerT m Value
 writeFileBody = liftContainer3 writeFileBodyIn
 
-writeFileBodyIn :: (MonadIO m, MonadThrow m)
+writeFileBodyIn :: (MonadIO m, MonadCatch m)
                 => Container -> FilePath -> Permission -> RequestBody -> LXDT m Value
 writeFileBodyIn c fp Permission{..} body =
   let hds = [ ("X-LXD-uid", BS.pack $ show uid) | Just uid <- return fileUID ]
@@ -839,25 +843,25 @@ writeFileBodyIn c fp Permission{..} body =
          }
      )
 
-writeFileStrIn :: (MonadIO m, MonadThrow m)
+writeFileStrIn :: (MonadIO m, MonadCatch m)
             => Container -> FilePath -> Permission -> String -> LXDT m Value
 writeFileStrIn c fp perm = writeFileBodyIn c fp perm . RequestBodyLBS . LBS.pack
 
-writeFileLBSIn :: (MonadIO m, MonadThrow m)
+writeFileLBSIn :: (MonadIO m, MonadCatch m)
             => Container -> FilePath -> Permission -> LBS.ByteString -> LXDT m Value
 writeFileLBSIn c perm fp = writeFileBodyIn c perm fp . RequestBodyLBS
 
-writeFileBSIn :: (MonadIO m, MonadThrow m)
+writeFileBSIn :: (MonadIO m, MonadCatch m)
               => Container -> FilePath -> Permission -> BS.ByteString -> LXDT m Value
 writeFileBSIn c perm fp = writeFileBodyIn c perm fp . RequestBodyBS
 
-writeFileStr :: (MonadThrow m, MonadIO m) => FilePath -> Permission -> String -> ContainerT m Value
+writeFileStr :: (MonadCatch m, MonadIO m) => FilePath -> Permission -> String -> ContainerT m Value
 writeFileStr = liftContainer3 writeFileStrIn
 
-writeFileLBS :: (MonadThrow m, MonadIO m) => FilePath -> Permission -> LBS.ByteString -> ContainerT m Value
+writeFileLBS :: (MonadCatch m, MonadIO m) => FilePath -> Permission -> LBS.ByteString -> ContainerT m Value
 writeFileLBS = liftContainer3 writeFileLBSIn
 
-writeFileBS :: (MonadThrow m, MonadIO m) => FilePath -> Permission -> BS.ByteString -> ContainerT m Value
+writeFileBS :: (MonadCatch m, MonadIO m) => FilePath -> Permission -> BS.ByteString -> ContainerT m Value
 writeFileBS = liftContainer3 writeFileBSIn
 
 readAsyncProcessIn :: (MonadBaseControl IO m, MonadIO m, MonadCatch m)
@@ -887,7 +891,7 @@ readAsyncProcess :: (MonadCatch m, MonadIO m, MonadBaseControl IO m)
                  -> ContainerT m (LBS.ByteString, LBS.ByteString)
 readAsyncProcess = liftContainer4 readAsyncProcessIn
 
-readFileOrListDirFrom :: (MonadThrow m, MonadIO m)
+readFileOrListDirFrom :: (MonadCatch m, MonadIO m)
                       => Container -> FilePath -> LXDT m (Either [FilePath] String)
 readFileOrListDirFrom c fp = do
   v <- fromSync =<< get (fileEndPoint c fp)

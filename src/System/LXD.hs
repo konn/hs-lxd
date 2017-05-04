@@ -925,7 +925,7 @@ fromAsync' act = do
 setContainerState :: (MonadIO m, MonadThrow m)
                   => Container -> ContainerAction -> LXDT m AsyncProcess
 setContainerState c cs =
-  fromAsync'$
+  fromAsync' $
   request (\q -> q { method = "PUT"
                    , requestBody = RequestBodyLBS $ encode cs })
     ("/1.0/containers/" <> T.unpack c <> "/state")
@@ -938,12 +938,12 @@ startContainer :: (MonadCatch m, MonadIO m)
                => Container
                -> Int           -- ^ timeout
                -> Bool          -- ^ is stateful?
-               -> LXDT m Bool
+               -> LXDT m (Maybe Value)
 startContainer c wait st = do
   ap <- setContainerState c (Start wait st)
-  isJust . fmap asValue <$> waitForOperationTimeout (Just wait) ap
+  fmap asValue <$> waitForOperationTimeout (Just wait) ap
 
-start :: (MonadIO m, MonadCatch m) => Int -> Bool -> ContainerT m Bool
+start :: (MonadIO m, MonadCatch m) => Int -> Bool -> ContainerT m (Maybe Value)
 start = liftContainer2 startContainer
 
 stopContainer :: (MonadCatch m, MonadIO m)

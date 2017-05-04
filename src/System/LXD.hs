@@ -929,6 +929,7 @@ fromAsync' act = do
       TaskProc{} -> return ()
       _ -> flip onException (liftIO $ atomically $ putTMVar (apExitCode ap0) (ExitFailure (-1))) $ do
         ans <- asValue <$> (fromSync =<< get (apOperation ap0 <> "/wait"))
+        liftIO $ print  ans
         liftIO $ atomically $ putTMVar (apExitCode ap0) $
           intToExitCode $ fromJust $ maybeAEResult $ AE.fromJSON $ ans ^?! key "return"
   mah <- getAsyncHandle ap0

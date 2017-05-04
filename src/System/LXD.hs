@@ -8,7 +8,7 @@
 {-# OPTIONS_GHC -fno-warn-type-defaults #-}
 module System.LXD ( LXDT, ContainerT, withContainer, Container
                   , LXDResult(..), AsyncClass(..), LXDResources(..)
-                  , LXDError(..), Device(..), defaultPermission
+                  , LXDError(..), Device, defaultPermission
                   , ContainerConfig(..), ContainerSource(..)
                   , LXDStatus(..), Interaction(..), Permission (..)
                   , ContainerAction(..), setContainerState, setState
@@ -45,7 +45,7 @@ import           Control.Exception               (Exception)
 import           Control.Exception.Lifted        (bracket, finally, handle,
                                                   throwIO)
 import           Control.Lens                    ((%~), _head, (^?!))
-import           Control.Monad                   (void)
+import           Control.Monad                   (void, (<=<))
 import Data.Aeson.Lens (key)
 import           Control.Monad.Base              (MonadBase (..),
                                                   liftBaseDefault)
@@ -516,8 +516,8 @@ instance ToJSON ContainerConfig where
                                         }
 
 
-createContainer :: (MonadThrow m, MonadIO m) => ContainerConfig -> LXDT m (LXDResult Value)
-createContainer = post "/1.0/containers"
+createContainer :: (MonadThrow m, MonadIO m) => ContainerConfig -> LXDT m ()
+createContainer = void . fmap (asValue . snd) . fromAsync <=< post "/1.0/containers"
 
 cloneContainer :: (MonadIO m, MonadThrow m)
                => Container           -- ^ original container name
@@ -526,7 +526,7 @@ cloneContainer :: (MonadIO m, MonadThrow m)
                -> Bool                -- ^ copy without snapshot?
                -> LXDConfig           -- ^ misc configurations
                -> HashMap Text Device -- ^ device dictionary
-               -> LXDT m (LXDResult Value)
+               -> LXDT m ()
 cloneContainer csSource cName cEphemeral csContainerOnly cConfig cDevices =
   let cSource = SourceCopy{..}
       cArchitecture = Nothing
@@ -951,12 +951,12 @@ startContainer :: (MonadIO m, MonadCatch m, MonadBaseControl IO m)
                => Container
                -> Int           -- ^ timeout
                -> Bool          -- ^ is stateful?
-               -> LXDT m (Maybe Value)
+               -> LXDT m ()
 startContainer c wait st = do
   ap <- setContainerState c (Start wait st)
-  fmap asValue <$> waitForOperationTimeout (Just wait) ap
+  void $ fmap asValue <$> waitForOperationTimeout (Just wait) ap
 
-start :: (MonadIO m, MonadCatch m, MonadBaseControl IO m) => Int -> Bool -> ContainerT m (Maybe Value)
+start :: (MonadIO m, MonadCatch m, MonadBaseControl IO m) => Int -> Bool -> ContainerT m ()
 start = liftContainer2 startContainer
 
 stopContainer :: (MonadIO m, MonadCatch m, MonadBaseControl IO m)

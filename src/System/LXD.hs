@@ -28,7 +28,7 @@ module System.LXD ( LXDT, ContainerT, withContainer, Container
                   , readFileOrListDirFrom, startContainer, start
                   , stopContainer, stop, killContainer, kill
                   ) where
-import           Conduit                         (Consumer, Producer, Source,
+import           Conduit                         (Consumer, Producer, Source,linesUnboundedAsciiC,
                                                   concatC, mapM_C, repeatMC, sinkHandle,
                                                   repeatWhileMC, runResourceT,
                                                   sinkLazy, ($$), (.|))
@@ -690,6 +690,7 @@ getAsyncHandle ap@ThreewayProc{..} = Just <$> do
   let iep = wsEP ap apStdin
       oep = wsEP ap apStdout
       eep = wsEP ap apStderr
+      cep = wsEP ap apControl
   (inCh, outCh, errCh) <-
     liftIO $ (,,) <$> newTBMQueueIO 10
                   <*> newTBMQueueIO 10
@@ -709,7 +710,10 @@ getAsyncHandle ap@ThreewayProc{..} = Just <$> do
       eact = flip finally (liftIO $ atomically $ closeTBMQueue errCh) $
                 handle (h' "stderr") $ runWS eep $ \conn ->
                 handle h  $ repeatMC (receiveData conn) $$ sinkTBMQueue errCh True
-  tid <- fork $ (iact `concurrently_` oact `concurrently_` eact) `untilEndOf` ap
+      cact = handle (h' "control") $ handle (h' "control") $ runWS cep $ \conn ->
+                repeatMC (receiveData conn) .| linesUnboundedAsciiC
+                $$ mapM_C (liftIO . LBS.putStrLn . ("CTRL: " <>))
+  tid <- fork $ (iact `concurrently_` oact `concurrently_` eact `concurrently` cact) `untilEndOf` ap
   let ahStdin  = atomically . writeTBMQueue inCh
       ahStdout = atomically $ readTBMQueue outCh
       ahStderr = atomically $ readTBMQueue errCh

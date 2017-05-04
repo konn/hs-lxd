@@ -931,7 +931,7 @@ fromAsync' act = do
         ans <- asValue <$> (fromSync =<< get (apOperation ap0 <> "/wait"))
         liftIO $ print  ans
         liftIO $ atomically $ putTMVar (apExitCode ap0) $
-          intToExitCode $ fromJust $ maybeAEResult $ AE.fromJSON $ ans ^?! key "return"
+          intToExitCode $ fromJust $ maybeAEResult $ AE.fromJSON $ ans ^?! key "metadata" . key "return"
   mah <- getAsyncHandle ap0
   return $ maybe ap0 (\ah -> ap0 { apHandle = ah { ahCloseProcess = ahCloseProcess ah >> killThread ti} })
              mah

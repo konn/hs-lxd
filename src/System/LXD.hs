@@ -666,6 +666,7 @@ getAsyncHandle :: (MonadBaseControl IO m, MonadCatch m, MonadIO m)
 getAsyncHandle TaskProc{} = return Nothing
 getAsyncHandle ap@InteractiveProc{..} = Just <$> do
   let ep = wsEP ap apISocket
+      cep = wsEP ap apControl
   (inCh, outCh) <- liftIO $ (,) <$> newTBMQueueIO 10 <*> newTBMQueueIO 10
   liftIO $ atomically $ writeTBMQueue inCh ""
   let close = atomically $ closeTBMQueue inCh >> closeTBMQueue outCh
@@ -676,11 +677,11 @@ getAsyncHandle ap@InteractiveProc{..} = Just <$> do
   let action = flip finally (liftIO close) $
                handle (h' "interactive") $ runWS ep $ \conn ->
                handle h $ flip finally (sendClose conn "") $ do
-                 sendBinaryData conn ""
                  (repeatMC (receiveData conn) $$ sinkTBMQueue outCh True)
                    `concurrently_`
                    (sourceTBMQueue inCh $$ mapM_C (sendBinaryData conn))
-  tid <- fork $ action `untilEndOf` ap
+      ctrl = runWS cep $ \conn -> sendClose conn ""
+  tid <- fork $ (action `concurrently_` ctrl) `untilEndOf` ap
   let ahStdin  = atomically . writeTBMQueue inCh
       ahOutput = atomically $ readTBMQueue outCh
       ahCloseStdin    = atomically (writeTBMQueue inCh "" >> closeTBMQueue inCh)
@@ -711,13 +712,12 @@ getAsyncHandle ap@ThreewayProc{..} = Just <$> do
                 handle (h' "stderr") $ runWS eep $ \conn ->
                 handle h  $ repeatMC (receiveData conn) $$ sinkTBMQueue errCh True
       cact = handle (h' "control") $ handle (h' "control") $ runWS cep $ \conn ->
-                repeatMC (receiveData conn) .| linesUnboundedAsciiC
-                $$ mapM_C (liftIO . LBS.putStrLn . ("CTRL: " <>))
+                sendClose conn ""
   tid <- fork $ (iact `concurrently_` oact `concurrently_` eact `concurrently` cact) `untilEndOf` ap
   let ahStdin  = atomically . writeTBMQueue inCh
       ahStdout = atomically $ readTBMQueue outCh
       ahStderr = atomically $ readTBMQueue errCh
-      ahCloseStdin = atomically (writeTBMQueue inCh "" >> closeTBMQueue inCh)
+      ahCloseStdin = atomically (closeTBMQueue inCh)
       ahCloseProcess = ahCloseStdin >> killThread tid >> close
   return $ ThreeHandle {..}
 

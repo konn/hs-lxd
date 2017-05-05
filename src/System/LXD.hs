@@ -34,7 +34,7 @@ import           Conduit                         (Consumer, Producer, Source,
                                                   repeatWhileMC, runResourceT,
                                                   sinkLazy, ($$), (.|))
 import           Control.Applicative             ((<|>))
-import           Control.Concurrent.Async.Lifted (concurrently, race_, race)
+import           Control.Concurrent.Async.Lifted (concurrently, race_, race, Concurrently(..))
 import           Control.Concurrent.Lifted       (fork, killThread, ThreadId, threadDelay)
 import           Control.Concurrent.STM          (atomically, TMVar)
 import System.IO (stderr,stdout)
@@ -633,8 +633,8 @@ cancelProcess :: (MonadBaseControl IO m, MonadIO m, MonadCatch m) => AsyncProces
 cancelProcess ap =
   discard $ fromSync =<< delete ("operations/" <> apOperation ap)
 
-waitForProcess :: (MonadBaseControl IO m, MonadIO m) => AsyncProcess -> LXDT m (Maybe ExitCode)
-waitForProcess = waitForProcessTimeout Nothing
+waitForProcess :: (MonadBaseControl IO m, MonadIO m) => AsyncProcess -> LXDT m ExitCode
+waitForProcess = fmap fromJust . waitForProcessTimeout Nothing
 
 getProcessExitCode :: (MonadBaseControl IO m) => AsyncProcess -> LXDT m (Maybe ExitCode)
 getProcessExitCode TaskProc{} = return Nothing
@@ -651,6 +651,7 @@ executeIn c cmd args ExecOptions{..} = do
         if isJust execGID || isJust execUID
         then "sudo" : foldMap (\a -> ["-g", "#" <> T.pack (show a)]) execGID
                    ++ foldMap (\a -> ["-u", "#" <> T.pack (show a)]) execUID
+                   ++ foldMap (\a -> ["PWD=" <> T.pack a]) execWorkingDir
                    ++ ("--" : cmd : args)
         else cmd : args
       eeEnvironment = maybe id (HM.insert "PWD" . T.pack) execWorkingDir execEnvironment
@@ -751,7 +752,7 @@ execute = liftContainer3 executeIn
 
 -- | Same as execute, but maps stdout/stderr to local ones.
 runCommandIn :: (MonadMask m, MonadBaseControl IO m, MonadIO m)
-             => Container -> Text -> [Text] -> ByteString -> ExecOptions -> LXDT m (Maybe ExitCode)
+             => Container -> Text -> [Text] -> ByteString -> ExecOptions -> LXDT m ExitCode
 runCommandIn c cmd args input opts = do
   bracket (executeIn c cmd args opts { execInteraction = Threeway })
     closeProcessIO $ \ap -> do
@@ -762,7 +763,7 @@ runCommandIn c cmd args input opts = do
               `concurrently` waitForProcess ap
 
 runCommand :: (MonadBaseControl IO m, MonadIO m, MonadMask m)
-           => Text -> [Text] -> ByteString -> ExecOptions -> ContainerT m (Maybe ExitCode)
+           => Text -> [Text] -> ByteString -> ExecOptions -> ContainerT m ExitCode
 runCommand = liftContainer4 runCommandIn
 
 asyncStdinWriter :: AsyncProcess -> Maybe (ByteString -> IO ())
@@ -881,13 +882,15 @@ writeFileBS = liftContainer3 writeFileBSIn
 
 readAsyncProcessIn :: (MonadBaseControl IO m, MonadIO m, MonadMask m)
                    => Container -> Text -> [Text] -> ByteString
-                   -> ExecOptions -> LXDT m (LBS.ByteString, LBS.ByteString)
+                   -> ExecOptions -> LXDT m (LBS.ByteString, LBS.ByteString, ExitCode)
 readAsyncProcessIn c cmd args input opts = do
   bracket (executeIn c cmd args opts { execInteraction = Threeway })
           (liftBase . ahCloseProcess . apHandle) $ \ap -> do
     liftBase (fromJust (asyncStdinWriter ap) input) `finally` closeStdin ap
-    (,) <$> (sourceAsyncStdout ap $$ sinkLazy)
-        <*> (sourceAsyncStderr ap $$ sinkLazy)
+    runConcurrently $ 
+      (,,) <$> Concurrently (sourceAsyncStdout ap $$ sinkLazy)
+           <*> Concurrently (sourceAsyncStderr ap $$ sinkLazy)
+           <*> Concurrently (waitForProcess ap)
 
 readAsyncStdout :: AsyncProcess -> IO (Maybe ByteString)
 readAsyncStdout ThreewayProc{..} = ahStdout apHandle
@@ -903,7 +906,7 @@ readAsyncOutput _ = return Nothing
 
 readAsyncProcess :: (MonadMask m, MonadBaseControl IO m, MonadIO m)
                  => Text -> [Text] -> ByteString -> ExecOptions
-                 -> ContainerT m (LBS.ByteString, LBS.ByteString)
+                 -> ContainerT m (LBS.ByteString, LBS.ByteString, ExitCode)
 readAsyncProcess = liftContainer4 readAsyncProcessIn
 
 readFileOrListDirFrom :: (MonadCatch m, MonadBaseControl IO m, MonadIO m)

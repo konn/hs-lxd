@@ -436,6 +436,23 @@ data AsyncProcess = TaskProc { apOperation :: String, apExitCode :: TMVar ExitCo
                                  , apExitCode :: TMVar ExitCode
                                  }
 
+instance Show AsyncProcess where
+  showsPrec d TaskProc{..} = showParen (d > 10) $ showString "TaskProc " . shows apOperation
+  showsPrec _ InteractiveProc{..} =
+    showString "InteractiveProc { apOperation = " . shows apOperation
+                  . showString ", apISocket = " . shows apISocket
+                  . showString ", apControl = " . shows apControl
+                  . showString ", apHandle = " . showsPrec 10 apHandle
+                  . showChar '}'
+  showsPrec _ ThreewayProc{..} =
+    showString "InteractiveProc { apOperation = " . shows apOperation
+                  . showString ", apStdin = " . shows apStdin
+                  . showString ", apStdout = " . shows apStdout
+                  . showString ", apStderr = " . shows apStderr
+                  . showString ", apControl = " . shows apControl
+                  . showString ", apHandle = " . showsPrec 10 apHandle
+                  . showChar '}'
+
 instance Show AsyncHandle where
   showsPrec _ SimpleHandle{..} = showString "<interactive handle>"
   showsPrec _ _ = showString "<threeway handle>"
@@ -939,6 +956,7 @@ setContainerState c cs = do
     request (\q -> q { method = "PUT"
                      , requestBody = RequestBodyLBS $ encode cs })
       ("/1.0/containers/" <> T.unpack c <> "/state")
+  liftIO $ print ap
   (== Just ExitSuccess) <$> waitForOperationTimeout (Just $ 2 * actTimeout cs) ap
 
 setState :: (MonadMask m, MonadBaseControl IO m, MonadIO m)

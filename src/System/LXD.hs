@@ -933,27 +933,26 @@ fromAsync act = act >>= \case
                mah
 
 setContainerState :: (MonadMask m, MonadBaseControl IO m, MonadIO m)
-                  => Container -> ContainerAction -> LXDT m AsyncProcess
-setContainerState c cs =
-  fromAsync $
-  request (\q -> q { method = "PUT"
-                   , requestBody = RequestBodyLBS $ encode cs })
-    ("/1.0/containers/" <> T.unpack c <> "/state")
+                  => Container -> ContainerAction -> LXDT m Bool
+setContainerState c cs = do
+  ap <- fromAsync $
+    request (\q -> q { method = "PUT"
+                     , requestBody = RequestBodyLBS $ encode cs })
+      ("/1.0/containers/" <> T.unpack c <> "/state")
+  (== Just ExitSuccess) <$> waitForOperationTimeout (Just $ 2 * actTimeout cs) ap
 
 setState :: (MonadMask m, MonadBaseControl IO m, MonadIO m)
-         => ContainerAction -> ContainerT m AsyncProcess
+         => ContainerAction -> ContainerT m Bool
 setState = liftContainer setContainerState
 
 startContainer :: (MonadMask m, MonadBaseControl IO m, MonadIO m)
                => Container
                -> Int           -- ^ timeout
                -> Bool          -- ^ is stateful?
-               -> LXDT m ()
-startContainer c wait st = do
-  ap <- setContainerState c (Start wait st)
-  void $ waitForOperationTimeout Nothing ap
+               -> LXDT m Bool   -- ^ successful?
+startContainer c wait st = setContainerState c (Start wait st)
 
-start :: (MonadMask m, MonadBaseControl IO m, MonadIO m) => Int -> Bool -> ContainerT m ()
+start :: (MonadMask m, MonadBaseControl IO m, MonadIO m) => Int -> Bool -> ContainerT m Bool
 start = liftContainer2 startContainer
 
 stopContainer :: (MonadMask m, MonadBaseControl IO m, MonadIO m)
@@ -961,12 +960,11 @@ stopContainer :: (MonadMask m, MonadBaseControl IO m, MonadIO m)
               -> Int           -- ^ timeout
               -> Bool          -- ^ is stateful?
               -> LXDT m Bool
-stopContainer c wait st = do
-  ap <- setContainerState c Stop { actTimeout  = wait
-                                 , actForce    = False
-                                 , actStateful = st
-                                 }
-  (== Just ExitSuccess) <$> waitForOperationTimeout (Just wait) ap
+stopContainer c wait st =
+  setContainerState c Stop { actTimeout  = wait
+                           , actForce    = False
+                           , actStateful = st
+                           }
 
 stop :: (MonadMask m, MonadBaseControl IO m, MonadIO m) => Int -> Bool -> ContainerT m Bool
 stop = liftContainer2 stopContainer
@@ -976,12 +974,11 @@ killContainer :: (MonadIO m, MonadMask m, MonadBaseControl IO m)
               -> Int           -- ^ timeout
               -> Bool          -- ^ is stateful?
               -> LXDT m Bool
-killContainer c wait st = do
-  ap <- setContainerState c Stop { actTimeout  = wait
-                                 , actForce    = True
-                                 , actStateful = st
-                                 }
-  (== Just ExitSuccess) <$> waitForOperationTimeout (Just wait) ap
+killContainer c wait st =
+  setContainerState c Stop { actTimeout  = wait
+                           , actForce    = True
+                           , actStateful = st
+                           }
 
 kill :: (MonadMask m, MonadBaseControl IO m, MonadIO m) => Int -> Bool -> ContainerT m Bool
 kill = liftContainer2 killContainer

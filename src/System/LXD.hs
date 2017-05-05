@@ -612,9 +612,13 @@ waitForOperationTimeout :: (MonadBaseControl IO m, MonadIO m)
                         => Maybe Int -> AsyncProcess -> LXDT m (Maybe ExitCode)
 waitForOperationTimeout mdur ap =
   let await = liftIO $ atomically (readTMVar $ apExitCode ap)
+      procTask i =
+        case ap of
+          TaskProc{} | i == -1 -> 0
+          _ -> i
   in case mdur of
-    Nothing -> Just <$> await
-    Just d  -> either Just (const Nothing) <$> await `race` liftIO (threadDelay $ d * 10^6)
+    Nothing -> Just . procTask <$> await
+    Just d  -> either (Just . procTask) (const Nothing) <$> await `race` liftIO (threadDelay $ d * 10^6)
 
 instance FromJSON WrappedExitCode where
   parseJSON = withObject "Container dictionary" $ \obj ->
@@ -956,8 +960,8 @@ setContainerState c cs = do
     request (\q -> q { method = "PUT"
                      , requestBody = RequestBodyLBS $ encode cs })
       ("/1.0/containers/" <> T.unpack c <> "/state")
-  liftIO $ print ap
-  (== Just ExitSuccess) <$> waitForOperationTimeout Nothing ap
+  ans <- waitForOperationTimeout Nothing ap
+  return $ ans == Just ExitSuccess
 
 setState :: (MonadMask m, MonadBaseControl IO m, MonadIO m)
          => ContainerAction -> ContainerT m Bool

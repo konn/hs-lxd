@@ -957,7 +957,7 @@ setContainerState c cs = do
                      , requestBody = RequestBodyLBS $ encode cs })
       ("/1.0/containers/" <> T.unpack c <> "/state")
   liftIO $ print ap
-  (== Just ExitSuccess) <$> waitForOperationTimeout (Just $ 2 * actTimeout cs) ap
+  (== Just ExitSuccess) <$> waitForOperationTimeout Nothing ap
 
 setState :: (MonadMask m, MonadBaseControl IO m, MonadIO m)
          => ContainerAction -> ContainerT m Bool

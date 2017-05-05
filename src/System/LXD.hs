@@ -6,6 +6,7 @@
 {-# LANGUAGE UndecidableInstances, ViewPatterns                            #-}
 {-# OPTIONS_GHC -fno-warn-name-shadowing #-}
 {-# OPTIONS_GHC -fno-warn-type-defaults #-}
+{-# OPTIONS_GHC -Wredundant-constraints #-}
 module System.LXD ( LXDT, ContainerT, withContainer, Container
                   , LXDResult(..), AsyncClass(..), LXDResources(..)
                   , LXDError(..), Device, defaultPermission
@@ -33,8 +34,8 @@ import           Conduit                         (Consumer, Producer, Source,
                                                   repeatWhileMC, runResourceT,
                                                   sinkLazy, ($$), (.|))
 import           Control.Applicative             ((<|>))
-import           Control.Concurrent.Async.Lifted (concurrently, race_)
-import           Control.Concurrent.Lifted       (fork, killThread)
+import           Control.Concurrent.Async.Lifted (concurrently, race_, race)
+import           Control.Concurrent.Lifted       (fork, killThread, ThreadId, threadDelay)
 import           Control.Concurrent.STM          (atomically, TMVar)
 import System.IO (stderr,stdout)
 import           Control.Concurrent.STM          (newEmptyTMVarIO, putTMVar,
@@ -42,15 +43,13 @@ import           Control.Concurrent.STM          (newEmptyTMVarIO, putTMVar,
 import           Control.Concurrent.STM.TBMQueue (closeTBMQueue, newTBMQueueIO,
                                                   readTBMQueue, writeTBMQueue)
 import           Control.Exception               (Exception)
-import           Control.Exception.Lifted        (bracket, finally, handle,
-                                                  throwIO)
-import           Control.Lens                    ((%~), _head, (^?!))
-import           Control.Monad                   (void, (<=<))
+import           Control.Lens                    ((%~), _head, (^?))
+import           Control.Monad                   (void)
 import Data.Aeson.Lens (key)
 import           Control.Monad.Base              (MonadBase (..),
                                                   liftBaseDefault)
-import           Control.Monad.Catch             (MonadThrow, MonadMask,onException,
-                                                  MonadCatch, catch, throwM)
+import           Control.Monad.Catch             (MonadThrow, MonadMask,onException,handle,
+                                                  MonadCatch, throwM, bracket, finally)
 import           Control.Monad.Trans             (MonadIO (..), MonadTrans (..))
 import           Control.Monad.Trans.Control     (MonadBaseControl (..),
                                                   MonadTransControl (..),
@@ -63,8 +62,7 @@ import           Data.Aeson                      (FromJSON (..), ToJSON (..))
 import           Data.Aeson                      (Value, eitherDecode, encode)
 import           Data.Aeson                      (genericToJSON, object)
 import           Data.Aeson                      (withObject, withScientific,
-                                                  (.:))
-import           Data.Aeson                      ((.=))
+                                                  (.:), (.:?),(.=))
 import qualified Data.Aeson                      as AE
 import           Data.Aeson.Types                (camelTo2, defaultOptions)
 import           Data.Aeson.Types                (fieldLabelModifier,
@@ -117,7 +115,7 @@ import           System.Exit                     (ExitCode (..))
 import           System.Posix.Types              (FileMode, GroupID, UserID)
 import           Wuss                            (runSecureClient)
 
-default (Text)
+default (Text, Int)
 
 concurrently_ :: MonadBaseControl IO f => f a -> f b -> f ()
 concurrently_ a b = void $ concurrently  a b
@@ -137,12 +135,14 @@ data LXDResult a = LXDSync { lxdStatus :: LXDStatus
                             , lxdAsyncMetadata  :: a
                             , lxdAsyncMayCancel :: Bool
                             , lxdAsyncError :: Text
+                            , lxdAsyncExitCode :: TMVar ExitCode
+                            , lxdAsyncWaiter :: ThreadId
                             }
                  | LXDError { lxdErrorCode     :: LXDStatus
                             , lxdErrorMessage  :: Text
-                            , lxdErrorMetadata :: Value
+                            , lxdErrorMetadata :: Maybe Value
                             }
-                 deriving (Read, Show, Eq)
+                 deriving (Eq)
 
 data LXDStatus = OperationCreated
                | Started
@@ -200,7 +200,7 @@ instance FromJSON a => FromJSON (LXDResult a) where
                         <*> obj .: "metadata"
       "error" -> LXDError <$> obj .: "error_code"
                           <*> obj .: "error"
-                          <*> obj .: "metadata"
+                          <*> obj .:? "metadata"
       "async" -> do
         lxdStatus <- obj .: "status_code"
         lxdAsyncOperation <- obj .: "operation"
@@ -215,6 +215,8 @@ instance FromJSON a => FromJSON (LXDResult a) where
                      , asMayCancel = lxdAsyncMayCancel
                      , asErr = lxdAsyncError
                      } <- obj .: "metadata"
+        let lxdAsyncExitCode = undefined
+            lxdAsyncWaiter = undefined
         return LXDAsync{..}
       _ -> fail ("Unknown result type: " ++ typ)
 
@@ -308,9 +310,9 @@ newtype ContainerT m a = ContainerT (ReaderT Container (LXDT m) a)
                                  MonadCatch, MonadThrow, MonadMask
                                 )
 
-runWS :: MonadIO m => EndPoint -> ClientApp a -> LXDT m a
+runWS :: (MonadBaseControl IO m) => EndPoint -> ClientApp a -> LXDT m a
 runWS ep app = LXDT $ ask >>= \case
-  LXDEnv _ Local -> liftIO $ do
+  LXDEnv _ Local -> liftBase $ do
     sock <- localSock
     runClientWithSocket
       sock "[::]"
@@ -318,7 +320,7 @@ runWS ep app = LXDT $ ask >>= \case
       defaultConnectionOptions
       []
       app
-  LXDEnv _ Remote{..} -> liftIO $
+  LXDEnv _ Remote{..} -> liftBase $
     runSecureClient lxdServerHost (fromMaybe 8443 lxdServerPort) ep app
 
 
@@ -328,12 +330,12 @@ baseUrl = LXDT $ ask >>= \case
   LXDEnv _ Remote{..} ->
     return $ "https://" ++ lxdServerHost ++ maybe "" ((':':).show) lxdServerPort
 
-runLXDT :: (MonadIO m, MonadCatch m) => LXDServer -> LXDT m a -> m a
+runLXDT :: (MonadBaseControl IO m) => LXDServer -> LXDT m a -> m a
 runLXDT Local (LXDT act) = do
-  man <- liftIO newLocalManager
+  man <- liftBase newLocalManager
   runReaderT act $ LXDEnv  man Local
 runLXDT rem@Remote{..} (LXDT act) = do
-  man <- liftIO $ newManager tlsManagerSettings
+  man <- liftBase $ newManager tlsManagerSettings
   runReaderT act $ LXDEnv man rem
 
 withContainer :: Container -> ContainerT m a -> LXDT m a
@@ -368,32 +370,46 @@ data LXDError = MalformedResponse { errorEndPoint :: EndPoint, errorMessage :: S
 
 instance Exception LXDError
 
-request :: (FromJSON a, MonadCatch m, MonadIO m)
+request :: (FromJSON a, MonadCatch m, MonadBaseControl IO m, MonadIO m)
         => (Request -> Request) -> EndPoint -> LXDT m (LXDResult a)
 request modif ep = do
   LXDEnv man _ <- LXDT ask
   url <- baseUrl
   rsp <- httpLbs (modif $ fromJust $ parseRequest $ url ++ ep) man
-  either (throwM . MalformedResponse ep . (<> LBS.unpack (responseBody rsp))) return $
+  r <- either (throwM . MalformedResponse ep . (<> LBS.unpack (responseBody rsp))) return $
     eitherDecode $ responseBody rsp
+  case r of
+    LXDAsync{..} -> do
+      lxdAsyncExitCode <- liftBase newEmptyTMVarIO
+      let unkExc = liftBase $ atomically $ putTMVar lxdAsyncExitCode (ExitFailure (-1))
+      lxdAsyncWaiter <-
+        fork $ flip onException unkExc $ do
+          let ep =  lxdAsyncOperation <> "/wait"
+          ans <- fromSync =<< request (\r -> r {responseTimeout = responseTimeoutNone }) ep
+          let ec = intToExitCode $ fromMaybe (- 1) $ 
+                   maybeAEResult . AE.fromJSON =<< asValue ans ^? key "metadata" . key "return"
+          liftBase $ atomically $ putTMVar lxdAsyncExitCode ec
+      return LXDAsync{..}
+    _ -> return r
 
-get :: (FromJSON a, MonadCatch m, MonadIO m) => EndPoint -> LXDT m (LXDResult a)
+get :: (FromJSON a, MonadCatch m, MonadBaseControl IO m, MonadIO m) => EndPoint -> LXDT m (LXDResult a)
 get = request $ \a -> a { method = "GET" }
 
-post :: (ToJSON a, MonadIO m, MonadCatch m, FromJSON b) => EndPoint -> a -> LXDT m (LXDResult b)
+post :: (ToJSON a, MonadBaseControl IO m, MonadIO m, MonadCatch m, FromJSON b)
+     => EndPoint -> a -> LXDT m (LXDResult b)
 post ep bdy = request (\a -> a { method = "POST"
                                , requestBody = RequestBodyLBS $ encode bdy
                                })
                       ep
 
-delete :: (MonadIO m, MonadCatch m, FromJSON a) => [Char] -> LXDT m (LXDResult a)
+delete :: (MonadBaseControl IO m, MonadIO m, MonadCatch m, FromJSON a) => [Char] -> LXDT m (LXDResult a)
 delete = request $ \a -> a { method = "DELETE" }
 
-closeStdin :: MonadIO m => AsyncProcess -> LXDT m ()
+closeStdin :: (MonadBaseControl IO m) => AsyncProcess -> LXDT m ()
 closeStdin TaskProc{} = return ()
-closeStdin ap = liftIO $ ahCloseStdin $ apHandle ap
+closeStdin ap = liftBase $ ahCloseStdin $ apHandle ap
 
-listContainers :: (MonadIO m, MonadCatch m) => LXDT m [Container]
+listContainers :: (MonadBaseControl IO m, MonadIO m, MonadCatch m) => LXDT m [Container]
 listContainers = fromSync =<< get "/1.0/containers"
 
 fromSync :: MonadCatch m => LXDResult a -> m a
@@ -404,15 +420,7 @@ fromSync LXDError{..} =
   throwM $ ServerError lxdErrorCode $
   unlines [T.unpack lxdErrorMessage, LBS.unpack (encode lxdErrorMetadata)]
 
-fromAsync :: MonadCatch m => LXDResult a -> m (Operation, a)
-fromAsync LXDAsync{..} = return (Operation lxdAsyncOperation, lxdAsyncMetadata)
-fromAsync LXDSync{}  =
-  throwM $ MalformedResponse "" "Synchronous result returned instead of asynchronous"
-fromAsync LXDError{..} =
-  throwM $ ServerError lxdErrorCode $
-  unlines [T.unpack lxdErrorMessage, LBS.unpack (encode lxdErrorMetadata)]
-
-data AsyncProcess = TaskProc { apOperation :: String }
+data AsyncProcess = TaskProc { apOperation :: String, apExitCode :: TMVar ExitCode }
                   | InteractiveProc { apOperation :: String
                                     , apISocket :: Text
                                     , apControl :: Text
@@ -432,10 +440,10 @@ instance Show AsyncHandle where
   showsPrec _ SimpleHandle{..} = showString "<interactive handle>"
   showsPrec _ _ = showString "<threeway handle>"
 
-newtype OpToAsync = OpToAsync (Operation -> IO AsyncProcess)
+newtype OpToAsync = OpToAsync (Operation -> TMVar ExitCode -> IO AsyncProcess)
 
 instance FromJSON OpToAsync where
-  parseJSON AE.Null = return $ OpToAsync $ return . TaskProc . runOperation
+  parseJSON AE.Null = return $ OpToAsync $ (return .) . TaskProc . runOperation
   parseJSON a = flip (AE.withObject "fd-object") a $ \obj -> do
     AE.Object fd <- obj .: "fds"
     apControl <- fd .: "control"
@@ -444,13 +452,11 @@ instance FromJSON OpToAsync where
           apStdout <- fd .: "1"
           apStderr <- fd .: "2"
           apStdin  <- fd .: "0"
-          return $ \ (Operation apOperation) -> do
-            apExitCode <- liftIO newEmptyTMVarIO
+          return $ \ (Operation apOperation) apExitCode -> do
             return ThreewayProc{..}
         inter = do
           apISocket <- fd .: "0"
-          return $ \ (Operation apOperation) -> do
-            apExitCode <- liftIO newEmptyTMVarIO
+          return $ \ (Operation apOperation) apExitCode -> do
             return InteractiveProc{..}
     OpToAsync <$> (three <|> inter)
 
@@ -516,13 +522,13 @@ instance ToJSON ContainerConfig where
                                         }
 
 
-createContainer :: (MonadCatch m, MonadBaseControl IO m, MonadIO m)
+createContainer :: (MonadMask m, MonadBaseControl IO m, MonadIO m)
                 => ContainerConfig -> LXDT m ()
 createContainer c = do
-  ap <- fromAsync' $ post "/1.0/containers" c
+  ap <- fromAsync $ post "/1.0/containers" c
   void $ waitForOperationTimeout Nothing ap
 
-cloneContainer :: (MonadIO m, MonadCatch m, MonadBaseControl IO m)
+cloneContainer :: (MonadBaseControl IO m, MonadIO m, MonadMask m)
                => Container           -- ^ original container name
                -> Container           -- ^ new copied container name
                -> Bool                -- ^ is ephemeral?
@@ -577,27 +583,21 @@ instance Default ExecOptions where
 defaultExecOptions :: ExecOptions
 defaultExecOptions = def
 
-waitForProcessTimeout :: (MonadIO m, MonadCatch m)
+waitForProcessTimeout :: (MonadBaseControl IO m, MonadIO m)
                       => Maybe Int -> AsyncProcess -> LXDT m (Maybe ExitCode)
-waitForProcessTimeout mdur ap = do
-  n <- (fmap intToExitCode . maybeAEResult . AE.fromJSON =<<)
-    <$> waitForOperationTimeout mdur ap
-  case n of
-    Just{} -> return n
-    Nothing -> getProcessExitCode ap
+waitForProcessTimeout mdur ap = waitForOperationTimeout mdur ap
 
 maybeAEResult :: AE.Result a -> Maybe a
 maybeAEResult (AE.Success a) = Just a
 maybeAEResult _ = Nothing
 
-waitForOperationTimeout :: (MonadIO m, MonadCatch m)
-                        => Maybe Int -> AsyncProcess -> LXDT m (Maybe Value)
-waitForOperationTimeout mdur ap = do
-  let q = maybe "" (BS.unpack . renderQuery True . pure . (,) "timeout" . Just . BS.pack . show) mdur
-      l = fromSync =<< request (\r -> r { responseTimeout = responseTimeoutNone } )
-                       (apOperation ap <> "/wait" <> q)
-      r = fromSync =<< get (apOperation ap)
-  l `catch` \(_ :: LXDError) -> r
+waitForOperationTimeout :: (MonadBaseControl IO m, MonadIO m)
+                        => Maybe Int -> AsyncProcess -> LXDT m (Maybe ExitCode)
+waitForOperationTimeout mdur ap =
+  let await = liftIO $ atomically (readTMVar $ apExitCode ap)
+  in case mdur of
+    Nothing -> Just <$> await
+    Just d  -> either Just (const Nothing) <$> await `race` liftIO (threadDelay $ d * 10^6)
 
 instance FromJSON WrappedExitCode where
   parseJSON = withObject "Container dictionary" $ \obj ->
@@ -608,21 +608,21 @@ newtype WrappedExitCode = WrappedExitCode (Maybe ExitCode)
 discard :: Functor f => f Value -> f ()
 discard = void
 
-cancelProcess :: (MonadIO m, MonadCatch m) => AsyncProcess -> LXDT m ()
+cancelProcess :: (MonadBaseControl IO m, MonadIO m, MonadCatch m) => AsyncProcess -> LXDT m ()
 cancelProcess ap =
   discard $ fromSync =<< delete ("operations/" <> apOperation ap)
 
-waitForProcess :: (MonadCatch m, MonadIO m) => AsyncProcess -> LXDT m (Maybe ExitCode)
+waitForProcess :: (MonadBaseControl IO m, MonadIO m) => AsyncProcess -> LXDT m (Maybe ExitCode)
 waitForProcess = waitForProcessTimeout Nothing
 
-getProcessExitCode :: (MonadIO m, MonadCatch m) => AsyncProcess -> LXDT m (Maybe ExitCode)
+getProcessExitCode :: (MonadBaseControl IO m) => AsyncProcess -> LXDT m (Maybe ExitCode)
 getProcessExitCode TaskProc{} = return Nothing
-getProcessExitCode ap = liftIO $ atomically $ tryReadTMVar $ apExitCode ap
+getProcessExitCode ap = liftBase $ atomically $ tryReadTMVar $ apExitCode ap
 
 intToExitCode :: Int -> ExitCode
 intToExitCode i = if i == 0 then ExitSuccess else ExitFailure i
 
-executeIn :: (MonadCatch m, MonadIO m, MonadBaseControl IO m)
+executeIn :: (MonadMask m, MonadBaseControl IO m, MonadIO m)
           => Container -> Text -> [Text] -> ExecOptions
           -> LXDT m AsyncProcess
 executeIn c cmd args ExecOptions{..} = do
@@ -639,7 +639,7 @@ executeIn c cmd args ExecOptions{..} = do
           RecordOnly    -> (False, True, False)
           Interactive   -> (True, False, True)
           Threeway      -> (True, False, False)
-  fromAsync' $ post ("/1.0/containers/" <> T.unpack c <> "/exec")  ExecOptions_ {..}
+  fromAsync $ post ("/1.0/containers/" <> T.unpack c <> "/exec")  ExecOptions_ {..}
 
 data AsyncHandle = SimpleHandle { ahStdin  :: ByteString -> IO ()
                                 , ahOutput :: IO (Maybe ByteString)
@@ -653,36 +653,31 @@ data AsyncHandle = SimpleHandle { ahStdin  :: ByteString -> IO ()
                                , ahCloseProcess :: IO ()
                                }
 
-untilEndOf :: (MonadBaseControl IO m, MonadCatch m, MonadIO m)
+untilEndOf :: (MonadBaseControl IO m, MonadIO m)
            => LXDT m a -> AsyncProcess -> LXDT m ()
-untilEndOf act ap = do
-  flag <- liftIO newEmptyTMVarIO
-  let timekeeper = do
-        ext <- waitForProcess ap
-        liftIO $ atomically (putTMVar flag ext)
-  (act `concurrently_` timekeeper) `race_` liftIO (atomically $ readTMVar flag)
+untilEndOf act ap = act `race_` waitForProcess ap
 
-getAsyncHandle :: (MonadBaseControl IO m, MonadCatch m, MonadIO m)
+getAsyncHandle :: (MonadBaseControl IO m, MonadIO m, MonadMask m)
                => AsyncProcess -> LXDT m (Maybe AsyncHandle)
 getAsyncHandle TaskProc{} = return Nothing
 getAsyncHandle ap@InteractiveProc{..} = Just <$> do
   let ep = wsEP ap apISocket
       cep = wsEP ap apControl
-  (inCh, outCh) <- liftIO $ (,) <$> newTBMQueueIO 10 <*> newTBMQueueIO 10
-  liftIO $ atomically $ writeTBMQueue inCh ""
+  (inCh, outCh) <- liftBase $ (,) <$> newTBMQueueIO 10 <*> newTBMQueueIO 10
+  liftBase $ atomically $ writeTBMQueue inCh ""
   let close = atomically $ closeTBMQueue inCh >> closeTBMQueue outCh
-      h ConnectionClosed = liftIO close
-      h CloseRequest{} = liftIO close
-      h e = throwIO e
-      h' lab e = throwIO $ WebSocketError lab e
-  let action = flip finally (liftIO close) $
+      h ConnectionClosed = liftBase close
+      h CloseRequest{} = liftBase close
+      h e = throwM e
+      h' lab e = throwM $ WebSocketError lab e
+  let action = flip finally (liftBase close) $
                handle (h' "interactive") $ runWS ep $ \conn ->
                handle h $ flip finally (sendClose conn "") $ do
                  (repeatMC (receiveData conn) $$ sinkTBMQueue outCh True)
                    `concurrently_`
                    (sourceTBMQueue inCh $$ mapM_C (sendBinaryData conn))
       ctrl = runWS cep $ \conn -> sendClose conn ""
-  tid <- fork $ (action `concurrently_` ctrl) `untilEndOf` ap
+  tid <- fork $ (action `concurrently_` ctrl) -- `untilEndOf` ap
   let ahStdin  = atomically . writeTBMQueue inCh
       ahOutput = atomically $ readTBMQueue outCh
       ahCloseStdin    = atomically (writeTBMQueue inCh "" >> closeTBMQueue inCh)
@@ -694,22 +689,22 @@ getAsyncHandle ap@ThreewayProc{..} = Just <$> do
       eep = wsEP ap apStderr
       cep = wsEP ap apControl
   (inCh, outCh, errCh) <-
-    liftIO $ (,,) <$> newTBMQueueIO 10
+    liftBase $ (,,) <$> newTBMQueueIO 10
                   <*> newTBMQueueIO 10
                   <*> newTBMQueueIO 10
-  liftIO $ atomically $ writeTBMQueue inCh ""
+  liftBase $ atomically $ writeTBMQueue inCh ""
   let close = atomically $ closeTBMQueue inCh >> closeTBMQueue outCh >> closeTBMQueue errCh
-      h ConnectionClosed = liftIO close
-      h CloseRequest{} = liftIO close
+      h ConnectionClosed = liftBase close
+      h CloseRequest{} = liftBase close
       h e = throwM e
       h' lab e = throwM $ WebSocketError lab e
-      iact = flip finally (liftIO $ atomically $ closeTBMQueue inCh) $
+      iact = flip finally (liftBase $ atomically $ closeTBMQueue inCh) $
                 handle (h' "stdin") $ runWS iep $ \conn ->
                 handle h $ sourceTBMQueue inCh $$ mapM_C (sendBinaryData conn)
-      oact = flip finally (liftIO $ atomically $ closeTBMQueue outCh) $
+      oact = flip finally (liftBase $ atomically $ closeTBMQueue outCh) $
                 handle (h' "stdout") $ runWS oep $ \conn ->
                 handle h  $ repeatMC (receiveData conn) $$ sinkTBMQueue outCh True
-      eact = flip finally (liftIO $ atomically $ closeTBMQueue errCh) $
+      eact = flip finally (liftBase $ atomically $ closeTBMQueue errCh) $
                 handle (h' "stderr") $ runWS eep $ \conn ->
                 handle h  $ repeatMC (receiveData conn) $$ sinkTBMQueue errCh True
       cact = handle (h' "control") $ handle (h' "control") $ runWS cep $ \conn ->
@@ -728,24 +723,24 @@ wsEP ap st =
           renderQuery True [("secret", Just $ T.encodeUtf8 st)]
   in apOperation ap <> "/websocket" <> q
 
-execute :: (MonadIO m, MonadBaseControl IO m, MonadCatch m)
+execute :: (MonadBaseControl IO m, MonadIO m, MonadMask m)
         => Text -> [Text] -> ExecOptions
         -> ContainerT m AsyncProcess
 execute = liftContainer3 executeIn
 
 -- | Same as execute, but maps stdout/stderr to local ones.
-runCommandIn :: (MonadIO m, MonadCatch m, MonadBaseControl IO m)
+runCommandIn :: (MonadMask m, MonadBaseControl IO m, MonadIO m)
              => Container -> Text -> [Text] -> ByteString -> ExecOptions -> LXDT m (Maybe ExitCode)
 runCommandIn c cmd args input opts = do
   bracket (executeIn c cmd args opts { execInteraction = Threeway })
     closeProcessIO $ \ap -> do
-    liftIO (fromMaybe (const $ return ()) (asyncStdinWriter ap) input)
+    liftBase (fromMaybe (const $ return ()) (asyncStdinWriter ap) input)
       `finally` closeStdin ap
     snd <$> (sourceAsyncStdout ap $$ sinkHandle stdout)
               `concurrently` (sourceAsyncStderr ap $$ sinkHandle stderr)
               `concurrently` waitForProcess ap
 
-runCommand :: (MonadBaseControl IO m, MonadCatch m, MonadIO m)
+runCommand :: (MonadBaseControl IO m, MonadIO m, MonadMask m)
            => Text -> [Text] -> ByteString -> ExecOptions -> ContainerT m (Maybe ExitCode)
 runCommand = liftContainer4 runCommandIn
 
@@ -753,26 +748,26 @@ asyncStdinWriter :: AsyncProcess -> Maybe (ByteString -> IO ())
 asyncStdinWriter TaskProc{..} = Nothing
 asyncStdinWriter ap = Just $ ahStdin $ apHandle ap
 
-sinkAsyncProcess :: MonadIO m => AsyncProcess -> Consumer ByteString m ()
+sinkAsyncProcess :: (MonadBaseControl IO m) => AsyncProcess -> Consumer ByteString m ()
 sinkAsyncProcess TaskProc{..} = mempty
 sinkAsyncProcess ap =
-  mapM_C (liftIO . ahStdin (apHandle ap))
+  mapM_C (liftBase . ahStdin (apHandle ap))
 
-sourcePopper :: MonadIO m => IO (Maybe ByteString) -> Producer m ByteString
-sourcePopper prod = repeatWhileMC (liftIO prod) isJust .| concatC
+sourcePopper :: (MonadBaseControl IO m) => IO (Maybe ByteString) -> Producer m ByteString
+sourcePopper prod = repeatWhileMC (liftBase prod) isJust .| concatC
 
-sourceAsyncOutput :: (MonadIO m, MonadCatch m, MonadBaseControl IO m)
+sourceAsyncOutput :: (MonadCatch m, MonadBaseControl IO m, MonadIO m)
                   => AsyncProcess -> m (Source m ByteString)
 sourceAsyncOutput TaskProc{..} = return $ return ()
 sourceAsyncOutput InteractiveProc{..} = return $ sourcePopper $ ahOutput apHandle
 sourceAsyncOutput p@ThreewayProc{} =
   runResourceT $ mergeSources [sourceAsyncStdout p, sourceAsyncStderr p] 20
 
-sourceAsyncStdout :: MonadIO m => AsyncProcess -> Producer m ByteString
+sourceAsyncStdout :: (MonadBaseControl IO m) => AsyncProcess -> Producer m ByteString
 sourceAsyncStdout ThreewayProc{..} = sourcePopper $ ahStdout apHandle
 sourceAsyncStdout _ = return ()
 
-sourceAsyncStderr :: MonadIO m => AsyncProcess -> Producer m ByteString
+sourceAsyncStderr :: (MonadBaseControl IO m) => AsyncProcess -> Producer m ByteString
 sourceAsyncStderr ThreewayProc{..} = sourcePopper $ ahStderr apHandle
 sourceAsyncStderr _ = return ()
 
@@ -825,10 +820,10 @@ defaultPermission = Permission Nothing Nothing Nothing
 instance Default Permission where
   def = defaultPermission
 
-writeFileBody :: (MonadCatch m, MonadIO m) => FilePath -> Permission -> RequestBody -> ContainerT m Value
+writeFileBody :: (MonadCatch m, MonadBaseControl IO m, MonadIO m) => FilePath -> Permission -> RequestBody -> ContainerT m Value
 writeFileBody = liftContainer3 writeFileBodyIn
 
-writeFileBodyIn :: (MonadIO m, MonadCatch m)
+writeFileBodyIn :: (MonadBaseControl IO m, MonadIO m, MonadCatch m)
                 => Container -> FilePath -> Permission -> RequestBody -> LXDT m Value
 writeFileBodyIn c fp Permission{..} body =
   let hds = [ ("X-LXD-uid", BS.pack $ show uid) | Just uid <- return fileUID ]
@@ -842,34 +837,34 @@ writeFileBodyIn c fp Permission{..} body =
          }
      )
 
-writeFileStrIn :: (MonadIO m, MonadCatch m)
+writeFileStrIn :: (MonadBaseControl IO m, MonadIO m, MonadCatch m)
             => Container -> FilePath -> Permission -> String -> LXDT m Value
 writeFileStrIn c fp perm = writeFileBodyIn c fp perm . RequestBodyLBS . LBS.pack
 
-writeFileLBSIn :: (MonadIO m, MonadCatch m)
+writeFileLBSIn :: (MonadBaseControl IO m, MonadIO m, MonadCatch m)
             => Container -> FilePath -> Permission -> LBS.ByteString -> LXDT m Value
 writeFileLBSIn c perm fp = writeFileBodyIn c perm fp . RequestBodyLBS
 
-writeFileBSIn :: (MonadIO m, MonadCatch m)
+writeFileBSIn :: (MonadBaseControl IO m, MonadIO m, MonadCatch m)
               => Container -> FilePath -> Permission -> BS.ByteString -> LXDT m Value
 writeFileBSIn c perm fp = writeFileBodyIn c perm fp . RequestBodyBS
 
-writeFileStr :: (MonadCatch m, MonadIO m) => FilePath -> Permission -> String -> ContainerT m Value
+writeFileStr :: (MonadCatch m, MonadBaseControl IO m, MonadIO m) => FilePath -> Permission -> String -> ContainerT m Value
 writeFileStr = liftContainer3 writeFileStrIn
 
-writeFileLBS :: (MonadCatch m, MonadIO m) => FilePath -> Permission -> LBS.ByteString -> ContainerT m Value
+writeFileLBS :: (MonadCatch m, MonadBaseControl IO m, MonadIO m) => FilePath -> Permission -> LBS.ByteString -> ContainerT m Value
 writeFileLBS = liftContainer3 writeFileLBSIn
 
-writeFileBS :: (MonadCatch m, MonadIO m) => FilePath -> Permission -> BS.ByteString -> ContainerT m Value
+writeFileBS :: (MonadCatch m, MonadBaseControl IO m, MonadIO m) => FilePath -> Permission -> BS.ByteString -> ContainerT m Value
 writeFileBS = liftContainer3 writeFileBSIn
 
-readAsyncProcessIn :: (MonadBaseControl IO m, MonadIO m, MonadCatch m)
+readAsyncProcessIn :: (MonadBaseControl IO m, MonadIO m, MonadMask m)
                    => Container -> Text -> [Text] -> ByteString
                    -> ExecOptions -> LXDT m (LBS.ByteString, LBS.ByteString)
 readAsyncProcessIn c cmd args input opts = do
   bracket (executeIn c cmd args opts { execInteraction = Threeway })
-          (liftIO . ahCloseProcess . apHandle) $ \ap -> do
-    liftIO (fromJust (asyncStdinWriter ap) input) `finally` closeStdin ap
+          (liftBase . ahCloseProcess . apHandle) $ \ap -> do
+    liftBase (fromJust (asyncStdinWriter ap) input) `finally` closeStdin ap
     (,) <$> (sourceAsyncStdout ap $$ sinkLazy)
         <*> (sourceAsyncStderr ap $$ sinkLazy)
 
@@ -885,12 +880,12 @@ readAsyncOutput :: AsyncProcess -> IO (Maybe ByteString)
 readAsyncOutput InteractiveProc{..} = ahOutput apHandle
 readAsyncOutput _ = return Nothing
 
-readAsyncProcess :: (MonadCatch m, MonadIO m, MonadBaseControl IO m)
+readAsyncProcess :: (MonadMask m, MonadBaseControl IO m, MonadIO m)
                  => Text -> [Text] -> ByteString -> ExecOptions
                  -> ContainerT m (LBS.ByteString, LBS.ByteString)
 readAsyncProcess = liftContainer4 readAsyncProcessIn
 
-readFileOrListDirFrom :: (MonadCatch m, MonadIO m)
+readFileOrListDirFrom :: (MonadCatch m, MonadBaseControl IO m, MonadIO m)
                       => Container -> FilePath -> LXDT m (Either [FilePath] String)
 readFileOrListDirFrom c fp = do
   v <- fromSync =<< get (fileEndPoint c fp)
@@ -900,9 +895,9 @@ readFileOrListDirFrom c fp = do
     _ -> throwM $ MalformedResponse (fileEndPoint c fp) $
          "File list or string expected, but got: " <> LBS.unpack (encode v)
 
-closeProcessIO :: MonadIO m => AsyncProcess -> LXDT m ()
+closeProcessIO :: (MonadBaseControl IO m) => AsyncProcess -> LXDT m ()
 closeProcessIO TaskProc{} = return ()
-closeProcessIO ap = liftIO $ ahCloseProcess $ apHandle ap
+closeProcessIO ap = liftBase $ ahCloseProcess $ apHandle ap
 
 data ContainerAction = Stop     { actTimeout :: Int
                                 , actStateful :: Bool
@@ -922,47 +917,46 @@ instance ToJSON ContainerAction where
            , AE.constructorTagModifier = _head %~ C.toLower
            }
 
-fromAsync' :: (MonadIO m, MonadCatch m, MonadBaseControl IO m)
+fromAsync :: (MonadMask m, MonadBaseControl IO m, MonadIO m)
            => LXDT m (LXDResult OpToAsync) -> LXDT m AsyncProcess
-fromAsync' act = do
-  (op, OpToAsync p) <- fromAsync =<< act
-  ap0 <- liftIO $ p op
-  ti <- fork $
-    case ap0 of
-      TaskProc{} -> return ()
-      _ -> flip onException (liftIO $ atomically $ putTMVar (apExitCode ap0) (ExitFailure (-1))) $ do
-        ans <- asValue <$> (fromSync =<< request (\r -> r {responseTimeout = responseTimeoutNone }) (apOperation ap0 <> "/wait"))
-        liftIO $ atomically $ putTMVar (apExitCode ap0) $
-          intToExitCode $ fromJust $ maybeAEResult $ AE.fromJSON $ ans ^?! key "metadata" . key "return"
-  mah <- getAsyncHandle ap0
-  return $ maybe ap0 (\ah -> ap0 { apHandle = ah { ahCloseProcess = ahCloseProcess ah >> killThread ti} })
-             mah
+fromAsync act = act >>= \case
+  LXDError{..} ->
+    throwM $ ServerError lxdErrorCode $
+    unlines [T.unpack lxdErrorMessage, LBS.unpack (encode lxdErrorMetadata)]
+  LXDSync{} ->
+    throwM $ MalformedResponse "" "Synchronous result returned instead of asynchronous"
+  
+  LXDAsync{..} | OpToAsync p <- lxdAsyncMetadata -> do
+    ap0 <- liftBase $ p (Operation lxdAsyncOperation) lxdAsyncExitCode
+    mah <- getAsyncHandle ap0
+    return $ maybe ap0 (\ah -> ap0 { apHandle = ah { ahCloseProcess = ahCloseProcess ah >> killThread lxdAsyncWaiter} })
+               mah
 
-setContainerState :: (MonadIO m, MonadCatch m, MonadBaseControl IO m)
+setContainerState :: (MonadMask m, MonadBaseControl IO m, MonadIO m)
                   => Container -> ContainerAction -> LXDT m AsyncProcess
 setContainerState c cs =
-  fromAsync' $
+  fromAsync $
   request (\q -> q { method = "PUT"
                    , requestBody = RequestBodyLBS $ encode cs })
     ("/1.0/containers/" <> T.unpack c <> "/state")
 
-setState :: (MonadIO m, MonadCatch m, MonadBaseControl IO m)
+setState :: (MonadMask m, MonadBaseControl IO m, MonadIO m)
          => ContainerAction -> ContainerT m AsyncProcess
 setState = liftContainer setContainerState
 
-startContainer :: (MonadIO m, MonadCatch m, MonadBaseControl IO m)
+startContainer :: (MonadMask m, MonadBaseControl IO m, MonadIO m)
                => Container
                -> Int           -- ^ timeout
                -> Bool          -- ^ is stateful?
                -> LXDT m ()
 startContainer c wait st = do
   ap <- setContainerState c (Start wait st)
-  void $ fmap asValue <$> waitForOperationTimeout Nothing ap
+  void $ waitForOperationTimeout Nothing ap
 
-start :: (MonadIO m, MonadCatch m, MonadBaseControl IO m) => Int -> Bool -> ContainerT m ()
+start :: (MonadMask m, MonadBaseControl IO m, MonadIO m) => Int -> Bool -> ContainerT m ()
 start = liftContainer2 startContainer
 
-stopContainer :: (MonadIO m, MonadCatch m, MonadBaseControl IO m)
+stopContainer :: (MonadMask m, MonadBaseControl IO m, MonadIO m)
               => Container
               -> Int           -- ^ timeout
               -> Bool          -- ^ is stateful?
@@ -972,12 +966,12 @@ stopContainer c wait st = do
                                  , actForce    = False
                                  , actStateful = st
                                  }
-  isJust . fmap asValue <$> waitForOperationTimeout (Just wait) ap
+  (== Just ExitSuccess) <$> waitForOperationTimeout (Just wait) ap
 
-stop :: (MonadIO m, MonadCatch m, MonadBaseControl IO m) => Int -> Bool -> ContainerT m Bool
+stop :: (MonadMask m, MonadBaseControl IO m, MonadIO m) => Int -> Bool -> ContainerT m Bool
 stop = liftContainer2 stopContainer
 
-killContainer :: (MonadIO m, MonadCatch m, MonadBaseControl IO m)
+killContainer :: (MonadIO m, MonadMask m, MonadBaseControl IO m)
               => Container
               -> Int           -- ^ timeout
               -> Bool          -- ^ is stateful?
@@ -987,9 +981,9 @@ killContainer c wait st = do
                                  , actForce    = True
                                  , actStateful = st
                                  }
-  isJust . fmap asValue <$> waitForOperationTimeout (Just wait) ap
+  (== Just ExitSuccess) <$> waitForOperationTimeout (Just wait) ap
 
-kill :: (MonadIO m, MonadCatch m, MonadBaseControl IO m) => Int -> Bool -> ContainerT m Bool
+kill :: (MonadMask m, MonadBaseControl IO m, MonadIO m) => Int -> Bool -> ContainerT m Bool
 kill = liftContainer2 killContainer
 
 asValue :: Value -> Value

@@ -614,7 +614,7 @@ waitForOperationTimeout mdur ap =
   let await = liftIO $ atomically (readTMVar $ apExitCode ap)
       procTask i =
         case ap of
-          TaskProc{} | i == -1 -> 0
+          TaskProc{} | i == ExitFailure (-1) -> ExitSuccess
           _ -> i
   in case mdur of
     Nothing -> Just . procTask <$> await

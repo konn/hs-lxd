@@ -20,6 +20,9 @@ library
   build-depends:       base >= 4.7 && < 5
                      , bytestring
                      , http-client
+                     , http-client-tls
+                     , tls
+                     , connection
                      , unix
                      , text
                      , http-conduit

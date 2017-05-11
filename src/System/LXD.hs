@@ -3,7 +3,7 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving, LambdaCase, MultiParamTypeClasses #-}
 {-# LANGUAGE NoMonomorphismRestriction, OverloadedStrings, RankNTypes      #-}
 {-# LANGUAGE RecordWildCards, ScopedTypeVariables, TypeFamilies            #-}
-{-# LANGUAGE UndecidableInstances, ViewPatterns                            #-}
+{-# LANGUAGE UndecidableInstances                                          #-}
 {-# OPTIONS_GHC -fno-warn-name-shadowing #-}
 {-# OPTIONS_GHC -fno-warn-type-defaults #-}
 {-# OPTIONS_GHC -Wredundant-constraints #-}
@@ -27,29 +27,31 @@ module System.LXD ( LXDT, ContainerT, withContainer, Container
                   , writeFileBS, writeFileBSIn, asyncStdinWriter
                   , writeFileLBS, writeFileLBSIn, runCommandIn, runCommand
                   , readFileOrListDirFrom, startContainer, start
-                  , stopContainer, stop, killContainer, kill
+                  , stopContainer, stop, killContainer, kill, addCertificate
                   ) where
 import           Conduit                         (Consumer, Producer, Source,
-                                                  concatC, mapM_C, repeatMC, sinkHandle,
+                                                  concatC, mapM_C, repeatMC,
                                                   repeatWhileMC, runResourceT,
-                                                  sinkLazy, ($$), (.|))
+                                                  sinkHandle, sinkLazy, ($$),
+                                                  (.|))
 import           Control.Applicative             ((<|>))
-import           Control.Concurrent.Async.Lifted (concurrently, race_, race, Concurrently(..))
-import           Control.Concurrent.Lifted       (fork, killThread, ThreadId, threadDelay)
-import           Control.Concurrent.STM          (atomically, TMVar)
-import System.IO (stderr,stdout)
+import           Control.Concurrent.Async.Lifted (Concurrently (..),
+                                                  concurrently, race, race_)
+import           Control.Concurrent.Lifted       (ThreadId, fork, killThread,
+                                                  threadDelay)
+import           Control.Concurrent.STM          (TMVar, atomically)
 import           Control.Concurrent.STM          (newEmptyTMVarIO, putTMVar,
                                                   readTMVar, tryReadTMVar)
 import           Control.Concurrent.STM.TBMQueue (closeTBMQueue, newTBMQueueIO,
                                                   readTBMQueue, writeTBMQueue)
 import           Control.Exception               (Exception)
-import           Control.Lens                    ((%~), _head, (^?))
+import           Control.Lens                    ((%~), (^?), _head)
 import           Control.Monad                   (void)
-import Data.Aeson.Lens (key)
 import           Control.Monad.Base              (MonadBase (..),
                                                   liftBaseDefault)
-import           Control.Monad.Catch             (MonadThrow, MonadMask,onException,handle,
-                                                  MonadCatch, throwM, bracket, finally)
+import           Control.Monad.Catch             (MonadCatch, MonadMask,
+                                                  MonadThrow, bracket, finally,
+                                                  handle, onException, throwM)
 import           Control.Monad.Trans             (MonadIO (..), MonadTrans (..))
 import           Control.Monad.Trans.Control     (MonadBaseControl (..),
                                                   MonadTransControl (..),
@@ -62,8 +64,9 @@ import           Data.Aeson                      (FromJSON (..), ToJSON (..))
 import           Data.Aeson                      (Value, eitherDecode, encode)
 import           Data.Aeson                      (genericToJSON, object)
 import           Data.Aeson                      (withObject, withScientific,
-                                                  (.:), (.:?),(.=))
+                                                  (.:), (.:?), (.=))
 import qualified Data.Aeson                      as AE
+import           Data.Aeson.Lens                 (key)
 import           Data.Aeson.Types                (camelTo2, defaultOptions)
 import           Data.Aeson.Types                (fieldLabelModifier,
                                                   omitNothingFields)
@@ -87,56 +90,69 @@ import           Data.Time                       (UTCTime, defaultTimeLocale,
                                                   parseTimeM)
 import           Data.Typeable                   (Typeable)
 import           GHC.Generics                    (Generic)
+import           Network.Connection              (ConnectionParams (..),
+                                                  TLSSettings (..), connectTo,
+                                                  connectionGetChunk,
+                                                  connectionPut,
+                                                  initConnectionContext)
 import           Network.HTTP.Client.Internal    (Connection, Manager)
 import           Network.HTTP.Client.Internal    (defaultManagerSettings)
 import           Network.HTTP.Client.Internal    (makeConnection)
 import           Network.HTTP.Client.Internal    (managerRawConnection,
                                                   newManager)
 import           Network.HTTP.Conduit            (Request (..),
-                                                  RequestBody (..))
-import           Network.HTTP.Conduit            (httpLbs, parseRequest)
-import           Network.HTTP.Conduit            (responseBody,
-                                                  responseTimeoutNone,
-                                                  tlsManagerSettings)
+                                                  RequestBody (..), httpLbs,
+                                                  mkManagerSettings,
+                                                  parseRequest, responseBody,
+                                                  responseTimeoutNone)
 import           Network.HTTP.Types.URI          (renderQuery)
 import           Network.Socket                  (Family (..), SockAddr (..))
 import           Network.Socket                  (SocketType (..), close,
                                                   connect)
 import           Network.Socket                  (PortNumber, Socket, socket)
 import qualified Network.Socket.ByteString       as BSSock
+import           Network.TLS                     (ClientParams (..),
+                                                  credentialLoadX509,
+                                                  defaultParamsClient,
+                                                  onCertificateRequest,
+                                                  onServerCertificate,
+                                                  supportedCiphers)
+import           Network.TLS.Extra.Cipher        (ciphersuite_all)
 import           Network.WebSockets              (ClientApp,
                                                   ConnectionException (..),
                                                   HandshakeException,
                                                   defaultConnectionOptions,
                                                   receiveData,
                                                   runClientWithSocket,
+                                                  runClientWithStream,
                                                   sendBinaryData, sendClose)
+import           Network.WebSockets.Stream       (makeStream)
 import           System.Exit                     (ExitCode (..))
+import           System.IO                       (stderr, stdout)
 import           System.Posix.Types              (FileMode, GroupID, UserID)
-import           Wuss                            (runSecureClient)
 
 default (Text, Int)
 
 concurrently_ :: MonadBaseControl IO f => f a -> f b -> f ()
 concurrently_ a b = void $ concurrently  a b
 
-data LXDResult a = LXDSync { lxdStatus :: LXDStatus
+data LXDResult a = LXDSync { lxdStatus   :: LXDStatus
                            , lxdMetadata :: a
                            }
-                 | LXDAsync { lxdAsyncOperation     :: String
-                            , lxdStatus        :: LXDStatus
-                            , lxdAsyncUUID     :: Text
-                            , lxdAsyncClass :: AsyncClass
-                            , lxdAsyncCreated :: UTCTime
-                            , lxdAsyncUpdated :: UTCTime
-                            , lxdAsyncStatus  :: Text
+                 | LXDAsync { lxdAsyncOperation  :: String
+                            , lxdStatus          :: LXDStatus
+                            , lxdAsyncUUID       :: Text
+                            , lxdAsyncClass      :: AsyncClass
+                            , lxdAsyncCreated    :: UTCTime
+                            , lxdAsyncUpdated    :: UTCTime
+                            , lxdAsyncStatus     :: Text
                             , lxdAsyncStatusCode :: Int
-                            , lxdAsyncResources :: LXDResources
-                            , lxdAsyncMetadata  :: a
-                            , lxdAsyncMayCancel :: Bool
-                            , lxdAsyncError :: Text
-                            , lxdAsyncExitCode :: TMVar ExitCode
-                            , lxdAsyncWaiter :: ThreadId
+                            , lxdAsyncResources  :: LXDResources
+                            , lxdAsyncMetadata   :: a
+                            , lxdAsyncMayCancel  :: Bool
+                            , lxdAsyncError      :: Text
+                            , lxdAsyncExitCode   :: TMVar ExitCode
+                            , lxdAsyncWaiter     :: ThreadId
                             }
                  | LXDError { lxdErrorCode     :: LXDStatus
                             , lxdErrorMessage  :: Text
@@ -183,7 +199,7 @@ statDic = [(100,OperationCreated)
 instance Enum LXDStatus where
   toEnum i = fromMaybe (UnknownCode i) $ lookup i statDic
   fromEnum (UnknownCode i) = i
-  fromEnum e = head [ i | (i, e') <- statDic, e == e']
+  fromEnum e               = head [ i | (i, e') <- statDic, e == e']
 
 instance FromJSON LXDStatus where
   parseJSON = withScientific "Status code" $ \s ->
@@ -256,16 +272,16 @@ instance FromJSON LXDTime where
     maybe (fail "illegal time format") (return . LXDTime) .
     parseTimeM False defaultTimeLocale "%FT%T%Q%z" . T.unpack
 
-data AsyncMetaData a = AsyncMetaData { asID :: Text
-                                     , asClass :: AsyncClass
-                                     , asCreatedAt :: LXDTime
-                                     , asUpdatedAt :: LXDTime
-                                     , asStatus  :: Text
+data AsyncMetaData a = AsyncMetaData { asID         :: Text
+                                     , asClass      :: AsyncClass
+                                     , asCreatedAt  :: LXDTime
+                                     , asUpdatedAt  :: LXDTime
+                                     , asStatus     :: Text
                                      , asStatusCode :: Int
-                                     , asResources :: LXDResources
-                                     , asMetadata  :: a
-                                     , asMayCancel :: Bool
-                                     , asErr :: Text
+                                     , asResources  :: LXDResources
+                                     , asMetadata   :: a
+                                     , asMayCancel  :: Bool
+                                     , asErr        :: Text
                                      }
                    deriving (Read, Show, Eq, Ord, Generic)
 
@@ -280,11 +296,12 @@ data LXDServer = Local
                         , lxdServerPort :: Maybe PortNumber
                         , lxdClientCert :: FilePath
                         , lxdClientKey  :: FilePath
-                        , lxdPassword   :: ByteString
+                        , lxdPassword   :: Maybe ByteString
                         }
                deriving (Read, Show, Eq, Ord)
 
-data LXDEnv = LXDEnv Manager LXDServer
+data LXDEnv = LXDLocalEnv Manager
+            | LXDRemoteEnv Manager String (Maybe PortNumber) TLSSettings
 
 newtype LXDT m a = LXDT { runLXDT_ :: ReaderT LXDEnv m a }
                  deriving (Functor, Applicative, Monad, MonadTrans,
@@ -312,7 +329,7 @@ newtype ContainerT m a = ContainerT (ReaderT Container (LXDT m) a)
 
 runWS :: (MonadBaseControl IO m) => EndPoint -> ClientApp a -> LXDT m a
 runWS ep app = LXDT $ ask >>= \case
-  LXDEnv _ Local -> liftBase $ do
+  LXDLocalEnv{} -> liftBase $ do
     sock <- localSock
     runClientWithSocket
       sock "[::]"
@@ -320,23 +337,52 @@ runWS ep app = LXDT $ ask >>= \case
       defaultConnectionOptions
       []
       app
-  LXDEnv _ Remote{..} -> liftBase $
-    runSecureClient lxdServerHost (fromMaybe 8443 lxdServerPort) ep app
+  LXDRemoteEnv _ host mport tlsSettings -> liftBase $ do
+    let port = fromMaybe 8443 mport
+        conParams = ConnectionParams { connectionHostname = host
+                                     , connectionPort = port
+                                     , connectionUseSecure = Just tlsSettings
+                                     , connectionUseSocks = Nothing
+                                     }
+    ctx  <- initConnectionContext
+    conn <- connectTo ctx conParams
+    stream <- makeStream
+              (Just <$> connectionGetChunk conn)
+              (maybe (return ()) (connectionPut conn . LBS.toStrict))
+    liftBase $ runClientWithStream
+      stream
+      host
+      ep
+      defaultConnectionOptions
+      []
+      app
 
 
 baseUrl :: Monad m => LXDT m [Char]
 baseUrl = LXDT $ ask >>= \case
-  LXDEnv _ Local -> return "http://localhost"
-  LXDEnv _ Remote{..} ->
-    return $ "https://" ++ lxdServerHost ++ maybe "" ((':':).show) lxdServerPort
+  LXDLocalEnv{} -> return "http://localhost"
+  LXDRemoteEnv _ host mport _ ->
+    return $ "https://" ++ host ++ maybe ":8443" ((':':).show) mport
 
-runLXDT :: (MonadBaseControl IO m) => LXDServer -> LXDT m a -> m a
+runLXDT :: (MonadBaseControl IO m, MonadThrow m) => LXDServer -> LXDT m a -> m a
 runLXDT Local (LXDT act) = do
   man <- liftBase newLocalManager
-  runReaderT act $ LXDEnv  man Local
-runLXDT rem@Remote{..} (LXDT act) = do
-  man <- liftBase $ newManager tlsManagerSettings
-  runReaderT act $ LXDEnv man rem
+  runReaderT act $ LXDLocalEnv man
+runLXDT Remote{..} (LXDT act) = do
+  creds <- either (throwM . TLSError) return
+           =<< liftBase (credentialLoadX509 lxdClientCert lxdClientKey)
+  let hooks = def { onCertificateRequest = const $ return $ Just creds
+                  , onServerCertificate = \_ _ _ _ -> return []
+                  }
+      clParams = (defaultParamsClient lxdServerHost "")
+                 { clientHooks = hooks
+                 , clientSupported = def { supportedCiphers = ciphersuite_all
+                                         }
+                 }
+      tlsConf = TLSSettings clParams
+      manSettings = mkManagerSettings tlsConf Nothing
+  man <- liftBase $ newManager manSettings
+  runReaderT act $ LXDRemoteEnv man lxdServerHost lxdServerPort tlsConf
 
 withContainer :: Container -> ContainerT m a -> LXDT m a
 withContainer c (ContainerT act) = runReaderT act c
@@ -366,14 +412,20 @@ data LXDError = MalformedResponse { errorEndPoint :: EndPoint, errorMessage :: S
               | ServerError { errorCode :: LXDStatus, errorMessage :: String }
               | WebSocketError { errorPos :: String, errorWebSock :: HandshakeException
                                }
+              | TLSError { errorMessage :: String }
               deriving (Show, Typeable)
 
 instance Exception LXDError
 
+askManager :: Monad m => LXDT m Manager
+askManager = LXDT $ ask >>= \case
+  LXDLocalEnv man -> return man
+  LXDRemoteEnv man _ _ _ -> return man
+
 request :: (FromJSON a, MonadCatch m, MonadBaseControl IO m, MonadIO m)
         => (Request -> Request) -> EndPoint -> LXDT m (LXDResult a)
 request modif ep = do
-  LXDEnv man _ <- LXDT ask
+  man <- askManager
   url <- baseUrl
   rsp <- httpLbs (modif $ fromJust $ parseRequest $ url ++ ep) man
   r <- either (throwM . MalformedResponse ep . (<> LBS.unpack (responseBody rsp))) return $
@@ -386,7 +438,7 @@ request modif ep = do
         fork $ flip onException unkExc $ do
           let ep =  lxdAsyncOperation <> "/wait"
           ans <- fromSync =<< request (\r -> r {responseTimeout = responseTimeoutNone }) ep
-          let ec = intToExitCode $ fromMaybe (- 1) $ 
+          let ec = intToExitCode $ fromMaybe (- 1) $
                    maybeAEResult . AE.fromJSON =<< asValue ans ^? key "metadata" . key "return"
           liftBase $ atomically $ putTMVar lxdAsyncExitCode ec
       return LXDAsync{..}
@@ -407,7 +459,7 @@ delete = request $ \a -> a { method = "DELETE" }
 
 closeStdin :: (MonadBaseControl IO m) => AsyncProcess -> LXDT m ()
 closeStdin TaskProc{} = return ()
-closeStdin ap = liftBase $ ahCloseStdin $ apHandle ap
+closeStdin ap         = liftBase $ ahCloseStdin $ apHandle ap
 
 listContainers :: (MonadBaseControl IO m, MonadIO m, MonadCatch m) => LXDT m [Container]
 listContainers = fromSync =<< get "/1.0/containers"
@@ -422,18 +474,18 @@ fromSync LXDError{..} =
 
 data AsyncProcess = TaskProc { apOperation :: String, apExitCode :: TMVar ExitCode }
                   | InteractiveProc { apOperation :: String
-                                    , apISocket :: Text
-                                    , apControl :: Text
-                                    , apHandle :: AsyncHandle
-                                    , apExitCode :: TMVar ExitCode
+                                    , apISocket   :: Text
+                                    , apControl   :: Text
+                                    , apHandle    :: AsyncHandle
+                                    , apExitCode  :: TMVar ExitCode
                                     }
                   | ThreewayProc { apOperation :: String
-                                 , apStdin   :: Text
-                                 , apStdout  :: Text
-                                 , apStderr  :: Text
-                                 , apControl :: Text
-                                 , apHandle :: AsyncHandle
-                                 , apExitCode :: TMVar ExitCode
+                                 , apStdin     :: Text
+                                 , apStdout    :: Text
+                                 , apStderr    :: Text
+                                 , apControl   :: Text
+                                 , apHandle    :: AsyncHandle
+                                 , apExitCode  :: TMVar ExitCode
                                  }
 
 instance Show AsyncProcess where
@@ -455,7 +507,7 @@ instance Show AsyncProcess where
 
 instance Show AsyncHandle where
   showsPrec _ SimpleHandle{..} = showString "<interactive handle>"
-  showsPrec _ _ = showString "<threeway handle>"
+  showsPrec _ _                = showString "<threeway handle>"
 
 newtype OpToAsync = OpToAsync (Operation -> TMVar ExitCode -> IO AsyncProcess)
 
@@ -491,7 +543,7 @@ type Fingerprint = ByteString
 
 data ImageSpec = ImageAlias { imgAlias :: Text }
                | ImageFingerprint { imgFingerprint :: ByteString }
-               | ImageProperties { imgOS :: Text
+               | ImageProperties { imgOS      :: Text
                                  , imgRelease :: Text
                                  , imgArchi   :: Text
                                  }
@@ -508,7 +560,7 @@ instance ToJSON ImageSpec where
 data ContainerSource = SourceImage
                        { csSourceImage :: ImageSpec }
                      | SourceCopy { csContainerOnly :: Bool
-                                  , csSource :: Container
+                                  , csSource        :: Container
                                   }
                      deriving (Read, Show, Eq, Ord, Generic)
 
@@ -523,13 +575,13 @@ instance ToJSON ContainerSource where
            ]
 
 data ContainerConfig =
-  ContainerConfig { cName :: Container
+  ContainerConfig { cName         :: Container
                   , cArchitecture :: Maybe Text
-                  , cProfiles :: [Text]
-                  , cEphemeral :: Bool
-                  , cConfig    :: LXDConfig
-                  , cDevices   :: HashMap Text Device
-                  , cSource    :: ContainerSource
+                  , cProfiles     :: [Text]
+                  , cEphemeral    :: Bool
+                  , cConfig       :: LXDConfig
+                  , cDevices      :: HashMap Text Device
+                  , cSource       :: ContainerSource
                   }
   deriving (Read, Show, Eq, Generic)
 
@@ -559,11 +611,11 @@ cloneContainer csSource cName cEphemeral csContainerOnly cConfig cDevices =
       cProfiles = []
   in  createContainer $ ContainerConfig {..}
 
-data ExecOptions_ = ExecOptions_ { eeCommand :: [Text]
-                                 , eeEnvironment :: HashMap Text Text
+data ExecOptions_ = ExecOptions_ { eeCommand          :: [Text]
+                                 , eeEnvironment      :: HashMap Text Text
                                  , eeWaitForWebsocket :: Bool
-                                 , eeRecordOutput :: Bool
-                                 , eeInteractive :: Bool
+                                 , eeRecordOutput     :: Bool
+                                 , eeInteractive      :: Bool
                                  }
                   deriving (Read, Show, Eq, Generic)
 
@@ -583,8 +635,8 @@ data Interaction = NoInteraction
 data ExecOptions = ExecOptions { execInteraction :: Interaction
                                , execWorkingDir  :: Maybe FilePath
                                , execEnvironment :: HashMap Text Text
-                               , execUID :: Maybe UserID
-                               , execGID :: Maybe GroupID
+                               , execUID         :: Maybe UserID
+                               , execGID         :: Maybe GroupID
                                }
                  deriving (Read, Show, Eq)
 
@@ -606,7 +658,7 @@ waitForProcessTimeout mdur ap = waitForOperationTimeout mdur ap
 
 maybeAEResult :: AE.Result a -> Maybe a
 maybeAEResult (AE.Success a) = Just a
-maybeAEResult _ = Nothing
+maybeAEResult _              = Nothing
 
 waitForOperationTimeout :: (MonadBaseControl IO m, MonadIO m)
                         => Maybe Int -> AsyncProcess -> LXDT m (Maybe ExitCode)
@@ -615,7 +667,7 @@ waitForOperationTimeout mdur ap =
       procTask i =
         case ap of
           TaskProc{} | i == ExitFailure (-1) -> ExitSuccess
-          _ -> i
+          _          -> i
   in case mdur of
     Nothing -> Just . procTask <$> await
     Just d  -> either (Just . procTask) (const Nothing) <$> await `race` liftIO (threadDelay $ d * 10^6)
@@ -663,15 +715,15 @@ executeIn c cmd args ExecOptions{..} = do
           Threeway      -> (True, False, False)
   fromAsync $ post ("/1.0/containers/" <> T.unpack c <> "/exec")  ExecOptions_ {..}
 
-data AsyncHandle = SimpleHandle { ahStdin  :: ByteString -> IO ()
-                                , ahOutput :: IO (Maybe ByteString)
-                                , ahCloseStdin :: IO ()
+data AsyncHandle = SimpleHandle { ahStdin        :: ByteString -> IO ()
+                                , ahOutput       :: IO (Maybe ByteString)
+                                , ahCloseStdin   :: IO ()
                                 , ahCloseProcess :: IO ()
                                 }
-                 | ThreeHandle { ahStdin  :: ByteString -> IO ()
-                               , ahStdout :: IO (Maybe ByteString)
-                               , ahStderr :: IO (Maybe ByteString)
-                               , ahCloseStdin  :: IO ()
+                 | ThreeHandle { ahStdin        :: ByteString -> IO ()
+                               , ahStdout       :: IO (Maybe ByteString)
+                               , ahStderr       :: IO (Maybe ByteString)
+                               , ahCloseStdin   :: IO ()
                                , ahCloseProcess :: IO ()
                                }
 
@@ -689,8 +741,8 @@ getAsyncHandle ap@InteractiveProc{..} = Just <$> do
   liftBase $ atomically $ writeTBMQueue inCh ""
   let close = atomically $ closeTBMQueue inCh >> closeTBMQueue outCh
       h ConnectionClosed = liftBase close
-      h CloseRequest{} = liftBase close
-      h e = throwM e
+      h CloseRequest{}   = liftBase close
+      h e                = throwM e
       h' lab e = throwM $ WebSocketError lab e
   let action = flip finally (liftBase close) $
                handle (h' "interactive") $ runWS ep $ \conn ->
@@ -717,8 +769,8 @@ getAsyncHandle ap@ThreewayProc{..} = Just <$> do
   liftBase $ atomically $ writeTBMQueue inCh ""
   let close = atomically $ closeTBMQueue inCh >> closeTBMQueue outCh >> closeTBMQueue errCh
       h ConnectionClosed = liftBase close
-      h CloseRequest{} = liftBase close
-      h e = throwM e
+      h CloseRequest{}   = liftBase close
+      h e                = throwM e
       h' lab e = throwM $ WebSocketError lab e
       iact = flip finally (liftBase $ atomically $ closeTBMQueue inCh) $
                 handle (h' "stdin") $ runWS iep $ \conn ->
@@ -768,7 +820,7 @@ runCommand = liftContainer4 runCommandIn
 
 asyncStdinWriter :: AsyncProcess -> Maybe (ByteString -> IO ())
 asyncStdinWriter TaskProc{..} = Nothing
-asyncStdinWriter ap = Just $ ahStdin $ apHandle ap
+asyncStdinWriter ap           = Just $ ahStdin $ apHandle ap
 
 sinkAsyncProcess :: (MonadBaseControl IO m) => AsyncProcess -> Consumer ByteString m ()
 sinkAsyncProcess TaskProc{..} = mempty
@@ -787,11 +839,11 @@ sourceAsyncOutput p@ThreewayProc{} =
 
 sourceAsyncStdout :: (MonadBaseControl IO m) => AsyncProcess -> Producer m ByteString
 sourceAsyncStdout ThreewayProc{..} = sourcePopper $ ahStdout apHandle
-sourceAsyncStdout _ = return ()
+sourceAsyncStdout _                = return ()
 
 sourceAsyncStderr :: (MonadBaseControl IO m) => AsyncProcess -> Producer m ByteString
 sourceAsyncStderr ThreewayProc{..} = sourcePopper $ ahStderr apHandle
-sourceAsyncStderr _ = return ()
+sourceAsyncStderr _                = return ()
 
 liftContainer4 :: Monad m
                => (Container -> t3 -> t2 -> t1 -> t -> LXDT m a)
@@ -831,8 +883,8 @@ fileEndPoint c fp =
    in "/1.0/containers/" <> T.unpack c <> "/files" <> BS.unpack q
 
 
-data Permission = Permission { fileUID :: Maybe UserID
-                             , fileGID :: Maybe GroupID
+data Permission = Permission { fileUID  :: Maybe UserID
+                             , fileGID  :: Maybe GroupID
                              , fileMode:: Maybe FileMode
                              }
                 deriving (Read, Show, Eq, Ord)
@@ -887,22 +939,22 @@ readAsyncProcessIn c cmd args input opts = do
   bracket (executeIn c cmd args opts { execInteraction = Threeway })
           (liftBase . ahCloseProcess . apHandle) $ \ap -> do
     liftBase (fromJust (asyncStdinWriter ap) input) `finally` closeStdin ap
-    runConcurrently $ 
+    runConcurrently $
       (,,) <$> Concurrently (sourceAsyncStdout ap $$ sinkLazy)
            <*> Concurrently (sourceAsyncStderr ap $$ sinkLazy)
            <*> Concurrently (waitForProcess ap)
 
 readAsyncStdout :: AsyncProcess -> IO (Maybe ByteString)
 readAsyncStdout ThreewayProc{..} = ahStdout apHandle
-readAsyncStdout _ = return Nothing
+readAsyncStdout _                = return Nothing
 
 readAsyncStderr :: AsyncProcess -> IO (Maybe ByteString)
 readAsyncStderr ThreewayProc{..} = ahStderr apHandle
-readAsyncStderr _ = return Nothing
+readAsyncStderr _                = return Nothing
 
 readAsyncOutput :: AsyncProcess -> IO (Maybe ByteString)
 readAsyncOutput InteractiveProc{..} = ahOutput apHandle
-readAsyncOutput _ = return Nothing
+readAsyncOutput _                   = return Nothing
 
 readAsyncProcess :: (MonadMask m, MonadBaseControl IO m, MonadIO m)
                  => Text -> [Text] -> ByteString -> ExecOptions
@@ -921,11 +973,11 @@ readFileOrListDirFrom c fp = do
 
 closeProcessIO :: (MonadBaseControl IO m) => AsyncProcess -> LXDT m ()
 closeProcessIO TaskProc{} = return ()
-closeProcessIO ap = liftBase $ ahCloseProcess $ apHandle ap
+closeProcessIO ap         = liftBase $ ahCloseProcess $ apHandle ap
 
-data ContainerAction = Stop     { actTimeout :: Int
+data ContainerAction = Stop     { actTimeout  :: Int
                                 , actStateful :: Bool
-                                , actForce :: Bool
+                                , actForce    :: Bool
                                 }
                      | Start    { actTimeout :: Int, actStateful :: Bool }
                      | Restart  { actTimeout :: Int, actForce :: Bool }
@@ -949,7 +1001,7 @@ fromAsync act = act >>= \case
     unlines [T.unpack lxdErrorMessage, LBS.unpack (encode lxdErrorMetadata)]
   LXDSync{} ->
     throwM $ MalformedResponse "" "Synchronous result returned instead of asynchronous"
-  
+
   LXDAsync{..} | OpToAsync p <- lxdAsyncMetadata -> do
     ap0 <- liftBase $ p (Operation lxdAsyncOperation) lxdAsyncExitCode
     mah <- getAsyncHandle ap0
@@ -1007,6 +1059,18 @@ killContainer c wait st =
 
 kill :: (MonadMask m, MonadBaseControl IO m, MonadIO m) => Int -> Bool -> ContainerT m Bool
 kill = liftContainer2 killContainer
+
+addCertificate :: (MonadCatch m, MonadIO m, MonadBaseControl IO m)
+               => Maybe String -> ByteString -> Maybe String -> LXDT m Value
+addCertificate mname cert mpass =
+  let val = object $ concat
+            [ ["type" .= "client"
+              ,"certificate" .= T.decodeUtf8 cert
+              ]
+            , foldMap (return . ("name" .=)) mname
+            , foldMap (return . ("password" .=)) mpass
+            ]
+  in fromSync =<< post "/1.0/certificates" val
 
 asValue :: Value -> Value
 asValue = id

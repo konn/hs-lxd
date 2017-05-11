@@ -40,7 +40,6 @@ library
                      , http-types
                      , websockets
                      , transformers
-                     , wuss
                      , websockets
                      , lifted-base
                      , stm

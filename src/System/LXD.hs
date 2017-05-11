@@ -1,10 +1,9 @@
 {-# LANGUAGE DeriveDataTypeable, DeriveGeneric, ExtendedDefaultRules       #-}
 {-# LANGUAGE FlexibleContexts, FlexibleInstances                           #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving, LambdaCase, MultiParamTypeClasses #-}
-{-# LANGUAGE NoMonomorphismRestriction, OverloadedStrings, RankNTypes      #-}
-{-# LANGUAGE RecordWildCards, ScopedTypeVariables, TypeFamilies            #-}
-{-# LANGUAGE UndecidableInstances                                          #-}
-{-# OPTIONS_GHC -fno-warn-name-shadowing #-}
+{-# LANGUAGE NamedFieldPuns, NoMonomorphismRestriction, OverloadedStrings  #-}
+{-# LANGUAGE RankNTypes, RecordWildCards, ScopedTypeVariables              #-}
+{-# LANGUAGE TypeFamilies, UndecidableInstances                            #-}
 {-# OPTIONS_GHC -fno-warn-type-defaults #-}
 {-# OPTIONS_GHC -Wredundant-constraints #-}
 module System.LXD ( LXDT, ContainerT, withContainer, Container
@@ -431,17 +430,17 @@ request modif ep = do
   r <- either (throwM . MalformedResponse ep . (<> LBS.unpack (responseBody rsp))) return $
     eitherDecode $ responseBody rsp
   case r of
-    LXDAsync{..} -> do
+    as@LXDAsync{lxdAsyncOperation} -> do
       lxdAsyncExitCode <- liftBase newEmptyTMVarIO
       let unkExc = liftBase $ atomically $ putTMVar lxdAsyncExitCode (ExitFailure (-1))
       lxdAsyncWaiter <-
         fork $ flip onException unkExc $ do
-          let ep =  lxdAsyncOperation <> "/wait"
-          ans <- fromSync =<< request (\r -> r {responseTimeout = responseTimeoutNone }) ep
+          let ep' =  lxdAsyncOperation <> "/wait"
+          ans <- fromSync =<< request (\q -> q {responseTimeout = responseTimeoutNone }) ep'
           let ec = intToExitCode $ fromMaybe (- 1) $
                    maybeAEResult . AE.fromJSON =<< asValue ans ^? key "metadata" . key "return"
           liftBase $ atomically $ putTMVar lxdAsyncExitCode ec
-      return LXDAsync{..}
+      return as{lxdAsyncExitCode, lxdAsyncWaiter}
     _ -> return r
 
 get :: (FromJSON a, MonadCatch m, MonadBaseControl IO m, MonadIO m) => EndPoint -> LXDT m (LXDResult a)
@@ -739,12 +738,12 @@ getAsyncHandle ap@InteractiveProc{..} = Just <$> do
       cep = wsEP ap apControl
   (inCh, outCh) <- liftBase $ (,) <$> newTBMQueueIO 10 <*> newTBMQueueIO 10
   liftBase $ atomically $ writeTBMQueue inCh ""
-  let close = atomically $ closeTBMQueue inCh >> closeTBMQueue outCh
-      h ConnectionClosed = liftBase close
-      h CloseRequest{}   = liftBase close
+  let cl = atomically $ closeTBMQueue inCh >> closeTBMQueue outCh
+      h ConnectionClosed = liftBase cl
+      h CloseRequest{}   = liftBase cl
       h e                = throwM e
       h' lab e = throwM $ WebSocketError lab e
-  let action = flip finally (liftBase close) $
+  let action = flip finally (liftBase cl) $
                handle (h' "interactive") $ runWS ep $ \conn ->
                handle h $ flip finally (sendClose conn "") $ do
                  (repeatMC (receiveData conn) $$ sinkTBMQueue outCh True)
@@ -755,7 +754,7 @@ getAsyncHandle ap@InteractiveProc{..} = Just <$> do
   let ahStdin  = atomically . writeTBMQueue inCh
       ahOutput = atomically $ readTBMQueue outCh
       ahCloseStdin    = atomically (writeTBMQueue inCh "" >> closeTBMQueue inCh)
-      ahCloseProcess  = ahCloseStdin >> killThread tid >> close
+      ahCloseProcess  = ahCloseStdin >> killThread tid >> cl
   return $ SimpleHandle {..}
 getAsyncHandle ap@ThreewayProc{..} = Just <$> do
   let iep = wsEP ap apStdin
@@ -767,9 +766,9 @@ getAsyncHandle ap@ThreewayProc{..} = Just <$> do
                   <*> newTBMQueueIO 10
                   <*> newTBMQueueIO 10
   liftBase $ atomically $ writeTBMQueue inCh ""
-  let close = atomically $ closeTBMQueue inCh >> closeTBMQueue outCh >> closeTBMQueue errCh
-      h ConnectionClosed = liftBase close
-      h CloseRequest{}   = liftBase close
+  let finish = atomically $ closeTBMQueue inCh >> closeTBMQueue outCh >> closeTBMQueue errCh
+      h ConnectionClosed = liftBase finish
+      h CloseRequest{}   = liftBase finish
       h e                = throwM e
       h' lab e = throwM $ WebSocketError lab e
       iact = flip finally (liftBase $ atomically $ closeTBMQueue inCh) $
@@ -788,8 +787,13 @@ getAsyncHandle ap@ThreewayProc{..} = Just <$> do
       ahStdout = atomically $ readTBMQueue outCh
       ahStderr = atomically $ readTBMQueue errCh
       ahCloseStdin = atomically (closeTBMQueue inCh)
-      ahCloseProcess = ahCloseStdin >> killThread tid >> close
+      ahCloseProcess = ahCloseStdin >> killThread tid >> finish
   return $ ThreeHandle {..}
+
+expectNull :: MonadThrow m => EndPoint -> Value -> m ()
+expectNull _  AE.Null = return ()
+expectNull ep b       =
+  throwM $ MalformedResponse ep $ "Expected null, but got: " <> LBS.unpack (encode b)
 
 wsEP :: AsyncProcess -> Text -> EndPoint
 wsEP ap st =
@@ -1061,7 +1065,7 @@ kill :: (MonadMask m, MonadBaseControl IO m, MonadIO m) => Int -> Bool -> Contai
 kill = liftContainer2 killContainer
 
 addCertificate :: (MonadCatch m, MonadIO m, MonadBaseControl IO m)
-               => Maybe String -> ByteString -> Maybe String -> LXDT m Value
+               => Maybe String -> ByteString -> Maybe String -> LXDT m ()
 addCertificate mname cert mpass =
   let val = object $ concat
             [ ["type" .= "client"
@@ -1070,7 +1074,7 @@ addCertificate mname cert mpass =
             , foldMap (return . ("name" .=)) mname
             , foldMap (return . ("password" .=)) mpass
             ]
-  in fromSync =<< post "/1.0/certificates" val
+  in expectNull "/1.0/certificates" =<< fromSync =<< post "/1.0/certificates" val
 
 asValue :: Value -> Value
 asValue = id

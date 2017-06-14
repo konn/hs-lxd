@@ -717,7 +717,6 @@ executeIn c cmd args ExecOptions{..} = do
           RecordOnly    -> (False, True, False)
           Interactive   -> (True, False, True)
           Threeway      -> (True, False, False)
-  liftIO $ putStrLn $ "exec: " <> show eeCommand
   fromAsync $ post ("/1.0/containers/" <> T.unpack c <> "/exec")  ExecOptions_ {..}
 
 data AsyncHandle = SimpleHandle { ahStdin        :: ByteString -> IO ()

@@ -13,6 +13,7 @@ module System.LXD ( LXDT, ContainerT, withContainer, Container
                   , LXDStatus(..), Interaction(..), Permission (..)
                   , ContainerAction(..), setContainerState, setState
                   , LXDConfig, LXDServer(..), AsyncProcess
+                  , ContainerInfo
                   , ExecOptions(..), ImageSpec(..), Alias, Fingerprint
                   , runLXDT, defaultExecOptions, waitForProcessTimeout
                   , createContainer, cloneContainer, waitForProcess
@@ -26,6 +27,7 @@ module System.LXD ( LXDT, ContainerT, withContainer, Container
                   , writeFileBS, writeFileBSIn, asyncStdinWriter
                   , writeFileLBS, writeFileLBSIn, runCommandIn, runCommand
                   , readFileOrListDirFrom, startContainer, start
+                  , getContainerInfo , putContainerInfo
                   , stopContainer, stop, killContainer, kill, addCertificate
                   ) where
 import           Conduit                         (Consumer, Producer, Source,
@@ -135,6 +137,7 @@ default (Text, Int)
 concurrently_ :: MonadBaseControl IO f => f a -> f b -> f ()
 concurrently_ a b = void $ concurrently  a b
 
+type ContainerInfo = Value
 data LXDResult a = LXDSync { lxdStatus   :: LXDStatus
                            , lxdMetadata :: a
                            }
@@ -702,7 +705,9 @@ executeIn c cmd args ExecOptions{..} = do
         if isJust execGID || isJust execUID
         then "sudo" : foldMap (\a -> ["-g", "#" <> T.pack (show a)]) execGID
                    ++ foldMap (\a -> ["-u", "#" <> T.pack (show a)]) execUID
-                   ++ foldMap (\a -> ["PWD=" <> T.pack a]) execWorkingDir
+                   ++ HM.foldrWithKey (\k v a -> (k <> "=" <> v) : a)
+                      (foldMap (\t -> ["PWD="<>T.pack t]) execWorkingDir)
+                       execEnvironment
                    ++ ("--" : cmd : args)
         else cmd : args
       eeEnvironment = maybe id (HM.insert "PWD" . T.pack) execWorkingDir execEnvironment
@@ -1049,6 +1054,21 @@ stopContainer c wait st =
 
 stop :: (MonadMask m, MonadBaseControl IO m, MonadIO m) => Int -> Bool -> ContainerT m Bool
 stop = liftContainer2 stopContainer
+
+getContainerInfo :: (MonadIO m, MonadBaseControl IO m, MonadCatch m)
+                 => Container -> LXDT m ContainerInfo
+getContainerInfo c =
+  fromSync =<< get ("/1.0/containers/" <> T.unpack c)
+
+putContainerInfo :: (MonadIO m, MonadMask m, MonadBaseControl IO m)
+                 => Container -> ContainerInfo -> LXDT m Bool
+putContainerInfo c info = do
+  ap <- fromAsync $
+    request (\q -> q { method = "PUT"
+                     , requestBody = RequestBodyLBS $ encode info })
+      ("/1.0/containers/" <> T.unpack c)
+  ans <- waitForOperationTimeout Nothing ap
+  return $ ans == Just ExitSuccess
 
 killContainer :: (MonadIO m, MonadMask m, MonadBaseControl IO m)
               => Container

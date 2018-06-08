@@ -293,7 +293,7 @@ instance FromJSON a => FromJSON (AsyncMetaData a) where
                              , fieldLabelModifier = camelTo2 '_' . drop 2
                              }
 
-data LXDServer = Local
+data LXDServer = Local { lxdSocketPath :: Maybe String }
                | Remote { lxdServerHost :: String
                         , lxdServerPort :: Maybe PortNumber
                         , lxdClientCert :: FilePath
@@ -302,7 +302,7 @@ data LXDServer = Local
                         }
                deriving (Read, Show, Eq, Ord)
 
-data LXDEnv = LXDLocalEnv Manager
+data LXDEnv = LXDLocalEnv (Maybe FilePath) Manager
             | LXDRemoteEnv Manager String (Maybe PortNumber) TLSSettings
 
 newtype LXDT m a = LXDT { runLXDT_ :: ReaderT LXDEnv m a }
@@ -331,8 +331,8 @@ newtype ContainerT m a = ContainerT (ReaderT Container (LXDT m) a)
 
 runWS :: (MonadBaseControl IO m) => EndPoint -> ClientApp a -> LXDT m a
 runWS ep app = LXDT $ ask >>= \case
-  LXDLocalEnv{} -> liftBase $ do
-    sock <- localSock
+  LXDLocalEnv msock _ -> liftBase $ do
+    sock <- localSock msock
     runClientWithSocket
       sock "[::]"
       ep
@@ -360,16 +360,16 @@ runWS ep app = LXDT $ ask >>= \case
       app
 
 
-baseUrl :: Monad m => LXDT m [Char]
+baseUrl :: Monad m => LXDT m String
 baseUrl = LXDT $ ask >>= \case
   LXDLocalEnv{} -> return "http://localhost"
   LXDRemoteEnv _ host mport _ ->
     return $ "https://" ++ host ++ maybe ":8443" ((':':).show) mport
 
 runLXDT :: (MonadBaseControl IO m, MonadThrow m) => LXDServer -> LXDT m a -> m a
-runLXDT Local (LXDT act) = do
-  man <- liftBase newLocalManager
-  runReaderT act $ LXDLocalEnv man
+runLXDT (Local mfp) (LXDT act) = do
+  man <- liftBase $ newLocalManager mfp
+  runReaderT act $ LXDLocalEnv mfp man
 runLXDT Remote{..} (LXDT act) = do
   creds <- either (throwM . TLSError) return
            =<< liftBase (credentialLoadX509 lxdClientCert lxdClientKey)
@@ -389,23 +389,24 @@ runLXDT Remote{..} (LXDT act) = do
 withContainer :: Container -> ContainerT m a -> LXDT m a
 withContainer c (ContainerT act) = runReaderT act c
 
-localSock :: IO Socket
-localSock = do
+localSock :: Maybe FilePath -> IO Socket
+localSock mfp = do
+  let sockPath = fromMaybe "/var/lib/lxd/unix.socket" mfp
   sock <- socket AF_UNIX Stream 0
-  connect sock $ SockAddrUnix "/var/lib/lxd/unix.socket"
+  connect sock $ SockAddrUnix sockPath
   return sock
 
-localConn :: IO Connection
-localConn = do
-  sock <- localSock
+localConn :: Maybe FilePath -> IO Connection
+localConn msock = do
+  sock <- localSock msock
   makeConnection (BSSock.recv sock 8192) (BSSock.sendAll sock) (close sock)
 
-newLocalManager :: IO Manager
-newLocalManager =
+newLocalManager :: Maybe FilePath -> IO Manager
+newLocalManager msock =
   newManager
     defaultManagerSettings
     { managerRawConnection =
-         return $ \ _ _ _ -> localConn
+         return $ \ _ _ _ -> localConn msock
     }
 
 type EndPoint = String
@@ -421,7 +422,7 @@ instance Exception LXDError
 
 askManager :: Monad m => LXDT m Manager
 askManager = LXDT $ ask >>= \case
-  LXDLocalEnv man -> return man
+  LXDLocalEnv _ man -> return man
   LXDRemoteEnv man _ _ _ -> return man
 
 request :: (FromJSON a, MonadCatch m, MonadBaseControl IO m, MonadIO m)
@@ -456,7 +457,7 @@ post ep bdy = request (\a -> a { method = "POST"
                                })
                       ep
 
-delete :: (MonadBaseControl IO m, MonadIO m, MonadCatch m, FromJSON a) => [Char] -> LXDT m (LXDResult a)
+delete :: (MonadBaseControl IO m, MonadIO m, MonadCatch m, FromJSON a) => String -> LXDT m (LXDResult a)
 delete = request $ \a -> a { method = "DELETE" }
 
 closeStdin :: (MonadBaseControl IO m) => AsyncProcess -> LXDT m ()

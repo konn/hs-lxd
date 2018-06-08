@@ -272,7 +272,7 @@ newtype LXDTime = LXDTime UTCTime
 instance FromJSON LXDTime where
   parseJSON = AE.withText "Date-time in YYYY-mm-ddTHH:MM:SS.qqqqqqq-00:00" $
     maybe (fail "illegal time format") (return . LXDTime) .
-    parseTimeM False defaultTimeLocale "%FT%T%Q%z" . T.unpack
+    parseTimeM False defaultTimeLocale "%FT%T%Q%Z" . T.unpack
 
 data AsyncMetaData a = AsyncMetaData { asID         :: Text
                                      , asClass      :: AsyncClass

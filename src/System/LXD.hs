@@ -612,8 +612,8 @@ cloneContainer :: (MonadBaseControl IO m, MonadIO m, MonadMask m)
 cloneContainer csSource cName cEphemeral csContainerOnly cConfig cDevices =
   let cSource = SourceCopy{..}
       cArchitecture = Nothing
-      cProfiles = []
-  in  createContainer $ ContainerConfig {..}
+      cProfiles = ["default"]
+  in  createContainer ContainerConfig {..}
 
 data ExecOptions_ = ExecOptions_ { eeCommand          :: [Text]
                                  , eeEnvironment      :: HashMap Text Text

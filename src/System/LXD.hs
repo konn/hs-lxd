@@ -597,6 +597,7 @@ instance ToJSON ContainerConfig where
 createContainer :: (MonadMask m, MonadBaseControl IO m, MonadIO m)
                 => ContainerConfig -> LXDT m ()
 createContainer c = do
+  liftIO $ putStrLn $ "Posting: " ++ LBS.unpack (AE.encode c)
   ap <- fromAsync $ post "/1.0/containers" c
   void $ waitForOperationTimeout Nothing ap
 
@@ -657,7 +658,7 @@ defaultExecOptions = def
 
 waitForProcessTimeout :: (MonadBaseControl IO m, MonadIO m)
                       => Maybe Int -> AsyncProcess -> LXDT m (Maybe ExitCode)
-waitForProcessTimeout mdur ap = waitForOperationTimeout mdur ap
+waitForProcessTimeout = waitForOperationTimeout
 
 maybeAEResult :: AE.Result a -> Maybe a
 maybeAEResult (AE.Success a) = Just a
